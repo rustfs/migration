@@ -1,0 +1,28 @@
+# Sample config. Environment variables override YAML values when set.
+# Env vars: OLD_ENDPOINT, OLD_AK, OLD_SK, OLD_REGION, NEW_ENDPOINT, NEW_AK,
+# NEW_SK, NEW_REGION, REGION, BUCKET, DB_PATH, CONFLICT_LOG, SPOOL_DIR
+
+old:
+  endpoint: "http://10.0.0.1:9000"
+  access_key: "OLD_AK"
+  secret_key: "OLD_SK"
+  region: "us-east-1"
+
+new:
+  endpoint: "http://haproxy.new.local:9000"
+  access_key: "NEW_AK"
+  secret_key: "NEW_SK"
+  region: "us-east-1"
+
+bucket: "my-bucket"
+db_path: "./migration.db"
+conflict_log: "./conflict.log"
+# spool_dir holds temp files for the small-object copy path. Defaults to the
+# directory containing db_path. Point this at on-disk storage if /tmp is tmpfs.
+spool_dir: ""
+
+# Migration tuning
+workers: 16                 # concurrent objects
+multipart_threshold: 52428800   # 50 MiB - switch to multipart above this size
+multipart_part_size: 16777216   # 16 MiB per part
+multipart_concurrency: 4    # parts uploaded in parallel per large object
