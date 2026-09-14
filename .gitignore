@@ -1,1 +1,9 @@
-/target
+/bin/
+/target/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+conflict.log
+conflict-*.log
+config.yaml
