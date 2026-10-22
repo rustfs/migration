@@ -321,6 +321,58 @@ func TestApplyConcurrencyOverridesRejectsZero(t *testing.T) {
 	}
 }
 
+func TestConcurrencyPriorityAndZeroDefaults(t *testing.T) {
+	base := "old: {endpoint: \"http://a:1\", access_key: a, secret_key: b}\n"
+	cases := []struct {
+		name    string
+		yaml    string
+		envW    string
+		envP    string
+		wantW   int
+		wantP   int
+		wantErr string
+	}{
+		{name: "omit uses defaults", wantW: 16, wantP: 4},
+		{name: "yaml zero uses defaults", yaml: "workers: 0\nmultipart_concurrency: 0\n", wantW: 16, wantP: 4},
+		{name: "yaml value kept", yaml: "workers: 5\nmultipart_concurrency: 3\n", wantW: 5, wantP: 3},
+		{name: "env overrides yaml", yaml: "workers: 5\nmultipart_concurrency: 3\n", envW: "8", envP: "6", wantW: 8, wantP: 6},
+		{name: "env workers only", yaml: "workers: 5\nmultipart_concurrency: 3\n", envW: "9", wantW: 9, wantP: 3},
+		{name: "negative yaml workers", yaml: "workers: -1\n", wantErr: "workers must be >= 1"},
+		{name: "negative yaml multipart", yaml: "multipart_concurrency: -2\n", wantErr: "multipart_concurrency must be >= 1"},
+		{name: "env workers zero", yaml: "workers: 5\n", envW: "0", wantErr: "WORKERS must be >= 1"},
+		{name: "env multipart zero", envP: "0", wantErr: "MULTIPART_CONCURRENCY must be >= 1"},
+		{name: "env workers negative", envW: "-4", wantErr: "WORKERS must be >= 1"},
+		{name: "env workers not integer", envW: "many", wantErr: "not an integer"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envW != "" {
+				t.Setenv("WORKERS", tc.envW)
+			}
+			if tc.envP != "" {
+				t.Setenv("MULTIPART_CONCURRENCY", tc.envP)
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(base+tc.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error %v, want substring %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Workers != tc.wantW || cfg.MultipartConcurrency != tc.wantP {
+				t.Fatalf("workers=%d multipart=%d, want %d and %d", cfg.Workers, cfg.MultipartConcurrency, tc.wantW, tc.wantP)
+			}
+		})
+	}
+}
+
 func TestJobBufferCaps(t *testing.T) {
 	if JobBuffer(1) != 2 {
 		t.Fatalf("got %d", JobBuffer(1))

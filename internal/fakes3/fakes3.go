@@ -54,6 +54,9 @@ type Server struct {
 	partDelay    time.Duration
 	partInFlight int
 	partMax      int
+	headDelay    time.Duration
+	headInFlight int
+	headMax      int
 }
 
 func New(t *testing.T) *Server {
@@ -112,6 +115,13 @@ func (s *Server) SetPartDelay(d time.Duration) {
 	s.mu.Unlock()
 }
 
+// SetHeadDelay sleeps inside each HeadObject so tests can observe overlap.
+func (s *Server) SetHeadDelay(d time.Duration) {
+	s.mu.Lock()
+	s.headDelay = d
+	s.mu.Unlock()
+}
+
 // MaxGetInFlight is the highest number of GetObject calls that overlapped.
 func (s *Server) MaxGetInFlight() int {
 	s.mu.Lock()
@@ -124,6 +134,13 @@ func (s *Server) MaxPartInFlight() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.partMax
+}
+
+// MaxHeadInFlight is the highest number of HeadObject calls that overlapped.
+func (s *Server) MaxHeadInFlight() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.headMax
 }
 
 func (s *Server) enterFlight(delay *time.Duration, cur, max *int) func() {
@@ -364,6 +381,9 @@ func (s *Server) listObjects(w http.ResponseWriter, bucket string) {
 }
 
 func (s *Server) headObject(w http.ResponseWriter, bucket, key string) {
+	release := s.enterFlight(&s.headDelay, &s.headInFlight, &s.headMax)
+	defer release()
+
 	s.mu.Lock()
 	bkt, ok := s.buckets[bucket]
 	var obj *object

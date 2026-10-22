@@ -772,6 +772,42 @@ func TestRunStopsWhenCancelled(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
 		t.Fatalf("cancel did not stop the worker pool promptly: %s", elapsed)
 	}
+	counts, err := st.Counts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Done != 0 {
+		t.Fatalf("cancel must not mark objects done: %+v", counts)
+	}
+	if oldS3.DeleteObjectCalls() != 0 || newS3.DeleteObjectCalls() != 0 || oldS3.CopyObjectCalls() != 0 || newS3.CopyObjectCalls() != 0 {
+		t.Fatalf("cancel issued unsafe calls: oldDelete=%d newDelete=%d oldCopy=%d newCopy=%d",
+			oldS3.DeleteObjectCalls(), newS3.DeleteObjectCalls(), oldS3.CopyObjectCalls(), newS3.CopyObjectCalls())
+	}
+}
+
+func TestRunRejectsNonPositiveMultipart(t *testing.T) {
+	ctx := context.Background()
+	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
+	oldS3 := fakes3.NewWithObjects(t, "bucket", map[string][]byte{"a.txt": []byte("a")}, lm)
+	defer oldS3.Close()
+	newS3 := fakes3.New(t)
+	defer newS3.Close()
+	tmp := t.TempDir()
+	st, err := store.Open(path.Join(tmp, "m.db"), "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := testCfg(path.Join(tmp, "m.db"), path.Join(tmp, "c.log"), tmp)
+	cfg.MultipartConcurrency = 0
+	m, err := New(cfg, newTestClient(t, ctx, oldS3.URL), newTestClient(t, ctx, newS3.URL), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Run(ctx); err == nil || !strings.Contains(err.Error(), "multipart_concurrency") {
+		t.Fatalf("got %v", err)
+	}
 }
 
 func testCfg(db, conflict, spool string) *appconfig.Config {

@@ -61,6 +61,36 @@ func TestDiffReportsMissingAndExtra(t *testing.T) {
 	}
 }
 
+func TestDiffWorkersCapParallelHeads(t *testing.T) {
+	ctx := context.Background()
+	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
+	objs := map[string][]byte{}
+	for i := 0; i < 8; i++ {
+		objs[string(rune('a'+i))+".txt"] = []byte("same")
+	}
+	oldS3 := fakes3.NewWithObjects(t, "bucket", objs, lm)
+	defer oldS3.Close()
+	newS3 := fakes3.NewWithObjects(t, "bucket", objs, lm)
+	defer newS3.Close()
+	newS3.SetHeadDelay(40 * time.Millisecond)
+
+	res, err := Run(ctx, testClient(t, ctx, oldS3.URL), testClient(t, ctx, newS3.URL), "bucket", Options{Workers: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.HasGaps() || res.OK != int64(len(objs)) {
+		t.Fatalf("expected clean diff: %+v", res)
+	}
+	got := newS3.MaxHeadInFlight()
+	if got < 2 || got > 3 {
+		t.Fatalf("diff workers=3 max in-flight HEADs=%d", got)
+	}
+	if oldS3.DeleteObjectCalls() != 0 || newS3.DeleteObjectCalls() != 0 || oldS3.CopyObjectCalls() != 0 || newS3.CopyObjectCalls() != 0 {
+		t.Fatalf("diff issued unsafe calls: oldDelete=%d newDelete=%d oldCopy=%d newCopy=%d",
+			oldS3.DeleteObjectCalls(), newS3.DeleteObjectCalls(), oldS3.CopyObjectCalls(), newS3.CopyObjectCalls())
+	}
+}
+
 func TestDiffCleanWhenInSync(t *testing.T) {
 	ctx := context.Background()
 	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
