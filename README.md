@@ -260,6 +260,6 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
 | Ctrl-C 退不出 | 等当前请求结束，或再按一次（退出码 130） |
 | diff 还有 missing | 再 `migration migrate`，并看 `failed` 行的 `last_error` |
 
-退出码：`0` 成功；`1` 配置错误、远端错误、某桶失败，或 diff 发现缺口；`130` 第二次信号强制退出。
+退出码：`0` 成功（只迁一个桶时，复制阶段第一次 Ctrl-C 也是 0，没做完的对象留在 SQLite）；`1` 配置错误、远端错误、某桶失败、diff 发现缺口，或在扫描 / 多桶切换时被中断；`130` 第二次信号强制退出。
 
 更细的状态机、路径和排错见 [docs/使用手册.md](docs/使用手册.md)。设计约束见 [docs/DESIGN.md](docs/DESIGN.md)。
