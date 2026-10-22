@@ -43,6 +43,7 @@ func Open(path, bucket string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	tuneSQLite(db)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
@@ -71,12 +72,23 @@ func ensureBucket(db *sql.DB, bucket string) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// tuneSQLite keeps a single connection. WAL still allows a writer plus
+// readers, but database/sql would otherwise open one connection per worker.
+// Those connections just queue on SQLite's single writer and surface as
+// "database is locked" once --workers is raised. Status updates stay
+// serialized here; object bytes stay on the S3 worker pool.
+func tuneSQLite(db *sql.DB) {
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+}
+
 // OpenExisting opens a state DB without rebinding it to a bucket.
 func OpenExisting(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
+	tuneSQLite(db)
 	s := &Store{db: db}
 	if _, err := s.BoundBucket(); err != nil {
 		db.Close()

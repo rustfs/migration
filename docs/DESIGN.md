@@ -100,13 +100,17 @@ isolation and makes both testable without the other.
 ### 5.2 Configuration (`internal/config`)
 
 - YAML is the primary configuration source.
-- Environment variables override YAML when set, in this order: per-cluster
-  `OLD_*` / `NEW_*` keys, the shared `REGION` fallback, then top-level
-  `BUCKET`, `DB_PATH`, `CONFLICT_LOG`, and `SPOOL_DIR`.
-- Defaults are applied after env-var merging, so `SPOOL_DIR=""` from YAML still
-  collapses to `filepath.Dir(c.DBPath)`.
-- `validate()` requires `bucket`, both endpoints, and a non-empty access /
-  secret key pair on each side.
+- Environment variables override YAML when set: per-cluster `OLD_*` / `NEW_*`
+  keys, the shared `REGION` fallback, then top-level `BUCKET`, `DB_PATH`,
+  `CONFLICT_LOG`, `SPOOL_DIR`, `WORKERS`, and `MULTIPART_CONCURRENCY`.
+- CLI flags win over both: `--bucket`, `--workers`, `--multipart-concurrency`.
+- Defaults are applied after env-var merging, so an omitted or zero
+  `workers` / `multipart_concurrency` / `SPOOL_DIR` still collapses to the
+  built-in default (`workers` 16, part concurrency 4, spool dir next to the
+  DB). Negative concurrency or size values are rejected. An explicit `0` in
+  `WORKERS`, `MULTIPART_CONCURRENCY`, or on the CLI is also rejected.
+- `bucket` may be empty (every source bucket). `list` / `scan` require the
+  source endpoint and keys; `run` / `migrate` / `diff` also require the target.
 
 ### 5.3 S3 client (`internal/s3client`)
 
@@ -171,7 +175,9 @@ Old is retried.
 
 ### 5.5 Scanner (`internal/scanner`)
 
-- Single goroutine driving `s3.NewListObjectsV2Paginator`.
+- Single goroutine driving `s3.NewListObjectsV2Paginator`. `workers` does
+  not apply: each page needs the previous continuation token, and the rows
+  land in one SQLite file.
 - Accumulates objects into a 500-row buffer, flushed inside one transaction.
   This trades a tiny memory footprint for batched fsyncs.
 - Honours `ctx.Done()` between pages so `SIGINT` during a scan is also
@@ -181,7 +187,7 @@ Old is retried.
 
 #### Worker pool
 
-- A buffered jobs channel of size `workers × 2`.
+- A buffered jobs channel of size `min(workers × 2, 2048)`.
 - `workers` goroutines consume jobs.
 - A feeder walks `BatchPendingAfter` (keyset pagination, 1000 rows) and
   pushes onto the channel, blocking on the cancellable context to
@@ -234,7 +240,9 @@ HEAD(New)
 2. `HeadObject(Old)` to capture common headers and user metadata, then
    `CreateMultipartUpload(New)` with those attributes.
 3. Spawn one goroutine per part, gated by a semaphore of size
-   `multipart_concurrency`. Each goroutine:
+   `multipart_concurrency`. The acquire selects on `ctx.Done()`, so Ctrl-C
+   does not block behind a full semaphore and does not schedule further
+   parts. Each goroutine:
    - Issues a ranged `GetObject(Old, Range=bytes=start-end)`.
    - Reads exactly that range into memory (bounded by `partSize`).
    - Calls `UploadPart(New)` with explicit `PartNumber` and `ContentLength`.
@@ -274,33 +282,46 @@ is crash-safe; restart simply continues appending.
 
 ### 5.8 CLI and signal handling (`cmd/root.go`)
 
-- `cobra` provides subcommands and flag parsing.
+- `cobra` provides subcommands and bilingual help.
+- Persistent flags: `-c/--config`, `--bucket`, `--workers`,
+  `--multipart-concurrency`. Priority is CLI, then environment, then YAML,
+  then the built-in default.
 - `signalCtx` wires `SIGINT` / `SIGTERM` to context cancellation. The first
-  signal triggers graceful shutdown; a second signal calls `os.Exit(130)` to
-  escape any uninterruptible call.
+  signal cancels the worker pool (in-flight multipart uploads are aborted,
+  not deleted); a second signal calls `os.Exit(130)`.
 
 ## 6. Concurrency and memory model
 
 - Peak in-flight HTTP bodies are bounded by
-  `workers × max(1, multipart_concurrency)`. Multipart memory is bounded by
-  `partSize` per in-flight part. Small uploads spool through temporary files
-  in `spool_dir` (default `filepath.Dir(db_path)`) so memory does not grow
-  with object size below the multipart threshold. Set `spool_dir` to a real
-  on-disk path when the host's `/tmp` is backed by tmpfs.
+  `workers × multipart_concurrency` (multipart concurrency is at least 1).
+  Multipart memory is bounded by `partSize` per in-flight part. The job
+  channel is capped (`JobBuffer`, at most 2048 descriptors) so a huge
+  `--workers` cannot queue the whole bucket in memory. Small uploads spool
+  through temporary files in `spool_dir` (default `filepath.Dir(db_path)`)
+  so memory does not grow with object size below the multipart threshold.
+  Set `spool_dir` to a real on-disk path when the host's `/tmp` is backed
+  by tmpfs. More workers means more of those temp files at once.
 - The first fatal persistence error cancels the worker context so the pool
   drains quickly. The error surfaced to the caller is still the first one
   observed; later cascading errors are swallowed.
-- The SDK's HTTP client handles connection pooling; we deliberately do not
-  customise it, so the default Go transport limits apply.
+- Each S3 client uses an `http.Transport` whose `MaxIdleConnsPerHost` follows
+  `workers × multipart_concurrency` (capped). That replaces the Go default of
+  2 idle connections per host so the worker pool can reuse connections. It
+  is not a hard cap on in-flight requests; the worker pool and the part
+  semaphore are.
+- The state DB uses WAL and `SetMaxOpenConns(1)`. Workers still copy in
+  parallel; only the status updates share one SQLite connection, which keeps
+  a high `--workers` from turning the single-writer lock into
+  `database is locked`.
 - Shared mutable state is limited to:
-  - Per-object SQLite rows (serialised by SQLite),
+  - Per-object SQLite rows (one connection, WAL),
   - Atomic counters (`atomic.Int64`),
   - The conflict-log mutex,
   - The mutex-protected `firstFatal` / `firstErr` slots inside `Run` and
     `copyMultipart`.
 
-There is **no global lock on the critical path** — workers proceed
-independently.
+There is **no global lock on the copy path** — workers proceed
+independently. Status rows share the single SQLite connection above.
 
 ## 7. Failure modes and responses
 

@@ -1,19 +1,21 @@
-# Sample config for `migration`.
-# 配置模板。环境变量若设置会覆盖 YAML。
+# migration 配置模板。
+# 优先级：命令行 > 环境变量 > 本文件 > 内置默认值。
+# Sample config. CLI flags override env, env overrides this file.
 #
 # Env / 环境变量:
 #   OLD_ENDPOINT OLD_AK OLD_SK OLD_REGION
 #   NEW_ENDPOINT NEW_AK NEW_SK NEW_REGION REGION
 #   BUCKET DB_PATH CONFLICT_LOG SPOOL_DIR
+#   WORKERS MULTIPART_CONCURRENCY
 
 old:
-  endpoint: "http://10.0.0.1:9000"     # source / 来源
+  endpoint: "http://10.0.0.1:9000"     # source / 来源（只读）
   access_key: "OLD_AK"
   secret_key: "OLD_SK"
   region: "us-east-1"
 
 new:
-  endpoint: "http://haproxy.new.local:9000"  # target / 目标
+  endpoint: "http://haproxy.new.local:9000"  # target / 目标（读 + 写，需能 CreateBucket）
   access_key: "NEW_AK"
   secret_key: "NEW_SK"
   region: "us-east-1"
@@ -26,13 +28,31 @@ db_path: "./migration.db"
 conflict_log: "./conflict.log"
 # Temp dir for small-object spooling. Default = directory of db_path.
 # 小对象落盘目录。默认是 db_path 所在目录。若 /tmp 是内存盘请改到真实磁盘。
+# workers 越大，同时存在的临时文件越多，请留出磁盘空间。
 spool_dir: ""
 
-# No bandwidth / rate_limit / MB/s field. Peak ≈ workers × multipart_concurrency.
+# 对象并发：run / migrate 同时复制多少个对象，diff 同时 HEAD 多少个对象。
+# scan 始终单线程（List 分页必须串行），不受此项影响。
+# 省略或写 0 = 默认 16。负数会报错。须 >= 1。
+# 命令行覆盖：--workers 32 。环境变量：WORKERS（覆盖本文件，但命令行优先）。
+# 小文件很多、源和代理都吃得消时再加大；出现 503、超时就减小。
+# 排错可以临时 --workers 1，等价于串行复制。
 # 没有 bandwidth、rate_limit 或 MB/s 字段。峰值大约是 workers × multipart_concurrency。
-# Lower workers first (then multipart_concurrency). Watch `migration status` and the NIC.
-# Stay under HAProxy maxconn. 先调小并发，再看 status 和网卡，留出 HAProxy maxconn 余量。
-workers: 16                     # objects copied at once / 同时拷贝的对象数（默认 16）
-multipart_threshold: 52428800   # 50 MiB；size ≥ this uses multipart / 达到则分片
-multipart_part_size: 16777216   # 16 MiB. Must be >= 5 MiB (5242880); smaller values fail at load and are not raised. / 非末片至少 5 MiB，更小则加载失败，不会被改写
-multipart_concurrency: 4        # parallel parts per large object / 单个大对象的并行分片数（默认 4）
+# 先调小并发，再看 status 和网卡，留出 HAProxy maxconn 余量。
+workers: 16
+
+# 对象大小 >= 该字节数时走分片上传。省略或 0 = 50MiB。
+multipart_threshold: 52428800   # 50 MiB
+
+# 每个分片的大小。省略或 0 = 16MiB。
+# 非末片必须 >= 5 MiB（5242880）。更小会在加载配置时失败，不会被改写。
+# 分片数要超过 S3 上限 10000 时，工具会自动加大分片，无需手算。
+multipart_part_size: 16777216   # 16 MiB
+
+# 单个大对象内部，同时上传多少个分片。与 workers 是两个旋钮。
+# 省略或写 0 = 默认 4。负数会报错。须 >= 1。
+# 命令行：--multipart-concurrency 8 。环境变量：MULTIPART_CONCURRENCY。
+# 只影响大对象。小文件吞吐看 workers，不看这项。
+# 峰值约 workers × multipart_concurrency 个打到同一集群的在途请求。
+# 例：16 × 4 = 64。代理 maxconn、源盘和目标盘都要撑得住这个乘积。
+multipart_concurrency: 4

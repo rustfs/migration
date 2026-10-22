@@ -78,10 +78,13 @@ func NewForBucket(cfg *config.Config, bucket string, oldCli, newCli *s3.Client, 
 func (m *Migrator) Close() error { return m.conflict.Close() }
 
 func (m *Migrator) Run(ctx context.Context) error {
+	if err := m.Cfg.ValidateConcurrency(); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	jobs := make(chan store.Object, m.Cfg.Workers*2)
+	jobs := make(chan store.Object, config.JobBuffer(m.Cfg.Workers))
 	var fatalMu sync.Mutex
 	var firstFatal error
 	recordFatal := func(err error) {
@@ -335,6 +338,11 @@ func (m *Migrator) copyMultipart(ctx context.Context, obj store.Object) error {
 		return err
 	}
 
+	partConc := m.Cfg.MultipartConcurrency
+	if partConc < 1 {
+		return fmt.Errorf("multipart_concurrency must be >= 1, got %d", partConc)
+	}
+
 	partSize := m.Cfg.MultipartPartSize
 	numParts := int((obj.Size + partSize - 1) / partSize)
 	if numParts > 10000 {
@@ -374,7 +382,7 @@ func (m *Migrator) copyMultipart(ctx context.Context, obj store.Object) error {
 	}
 
 	parts := make([]s3types.CompletedPart, numParts)
-	sem := make(chan struct{}, m.Cfg.MultipartConcurrency)
+	sem := make(chan struct{}, partConc)
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
@@ -391,18 +399,26 @@ func (m *Migrator) copyMultipart(ctx context.Context, obj store.Object) error {
 		return firstErr
 	}
 
+partLoop:
 	for i := 0; i < numParts; i++ {
-		if ctx.Err() != nil {
-			break
-		}
 		if getFirstErr() != nil {
 			break
 		}
+		select {
+		case <-ctx.Done():
+			// Do not block on a full semaphore after Ctrl-C, and do not
+			// start parts that have not been scheduled yet.
+			break partLoop
+		case sem <- struct{}{}:
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			if err := ctx.Err(); err != nil {
+				setFirstErr(err)
+				return
+			}
 
 			start := int64(idx) * partSize
 			end := start + partSize - 1

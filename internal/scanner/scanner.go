@@ -18,6 +18,10 @@ const batchSize = 500
 // Run lists every object in bucket on the source cluster and persists
 // metadata into the store. Full ListObjectsV2 (S3 has no LastModified
 // server filter); re-runs only refresh pending/failed/skipped rows.
+//
+// Listing stays single-threaded on purpose: each page needs the previous
+// continuation token, and the rows land in one SQLite file. Object
+// concurrency (workers) applies to copy and diff, not to scan.
 func Run(ctx context.Context, cli *s3.Client, bucket string, st *store.Store) (int64, error) {
 	if err := cluster.HeadBucket(ctx, cli, bucket); err != nil {
 		return 0, err
