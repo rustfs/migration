@@ -18,6 +18,7 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/rustfs/migration/internal/config"
+	"github.com/rustfs/migration/internal/ratelimit"
 	"github.com/rustfs/migration/internal/s3client"
 	"github.com/rustfs/migration/internal/store"
 )
@@ -38,6 +39,11 @@ type Migrator struct {
 	skipped   atomic.Int64
 	failed    atomic.Int64
 	bytes     atomic.Int64
+
+	// lim is shared by every worker and every multipart part of this migrator.
+	// Nil means unlimited. Buckets are copied one at a time, so this is the
+	// process-wide source-read cap while a copy is running.
+	lim *ratelimit.Limiter
 }
 
 type objectAttrs struct {
@@ -72,6 +78,7 @@ func NewForBucket(cfg *config.Config, bucket string, oldCli, newCli *s3.Client, 
 		NewCli:   newCli,
 		Store:    st,
 		conflict: cw,
+		lim:      ratelimit.New(int64(cfg.RateLimit)),
 	}, nil
 }
 
@@ -286,7 +293,7 @@ func (m *Migrator) copySingle(ctx context.Context, obj store.Object) error {
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
 
-	written, err := io.Copy(tmp, out.Body)
+	written, err := io.Copy(tmp, m.throttle(ctx, out.Body))
 	if err != nil {
 		return fmt.Errorf("spool old body: %w", err)
 	}
@@ -436,7 +443,7 @@ partLoop:
 				setFirstErr(fmt.Errorf("get part %d: %w", idx+1, gerr))
 				return
 			}
-			body, rerr := io.ReadAll(getOut.Body)
+			body, rerr := io.ReadAll(m.throttle(ctx, getOut.Body))
 			getOut.Body.Close()
 			if rerr != nil {
 				setFirstErr(fmt.Errorf("read part %d: %w", idx+1, rerr))
@@ -491,6 +498,12 @@ partLoop:
 		return fmt.Errorf("size mismatch after multipart: got=%d want=%d", deref(head.ContentLength), obj.Size)
 	}
 	return nil
+}
+
+// throttle charges source body bytes to the shared limiter. Metadata HEAD
+// requests are not charged. A nil limiter returns the reader unchanged.
+func (m *Migrator) throttle(ctx context.Context, r io.Reader) io.Reader {
+	return ratelimit.Wrap(ctx, r, m.lim)
 }
 
 func deref(p *int64) int64 {

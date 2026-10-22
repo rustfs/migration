@@ -102,13 +102,20 @@ isolation and makes both testable without the other.
 - YAML is the primary configuration source.
 - Environment variables override YAML when set: per-cluster `OLD_*` / `NEW_*`
   keys, the shared `REGION` fallback, then top-level `BUCKET`, `DB_PATH`,
-  `CONFLICT_LOG`, `SPOOL_DIR`, `WORKERS`, and `MULTIPART_CONCURRENCY`.
-- CLI flags win over both: `--bucket`, `--workers`, `--multipart-concurrency`.
+  `CONFLICT_LOG`, `SPOOL_DIR`, `WORKERS`, `MULTIPART_CONCURRENCY`, and
+  `RATE_LIMIT`.
+- CLI flags win over both: `--bucket`, `--workers`, `--multipart-concurrency`,
+  `--rate-limit`.
 - Defaults are applied after env-var merging, so an omitted or zero
   `workers` / `multipart_concurrency` / `SPOOL_DIR` still collapses to the
   built-in default (`workers` 16, part concurrency 4, spool dir next to the
   DB). Negative concurrency or size values are rejected. An explicit `0` in
   `WORKERS`, `MULTIPART_CONCURRENCY`, or on the CLI is also rejected.
+- `rate_limit` is a byte rate (`20M` = 20×1000×1000 B/s, `20MiB` =
+  20×1024×1024 B/s, or a bare byte count). `0` or omit means unlimited at
+  every layer, including the CLI and `RATE_LIMIT`. Negative values and
+  unknown suffixes are rejected. This knob does not follow the concurrency
+  rule where YAML `0` means "use the default".
 - `bucket` may be empty (every source bucket). `list` / `scan` require the
   source endpoint and keys; `run` / `migrate` / `diff` also require the target.
 
@@ -193,6 +200,15 @@ Old is retried.
   pushes onto the channel, blocking on the cancellable context to
   back-pressure naturally.
 - A 10-second ticker logs aggregate counters from `atomic.Int64` fields.
+- Source body reads (the small-object spool and each multipart range) share
+  one token bucket, `cfg.RateLimit` (`internal/ratelimit`). Nil / `0` is
+  unlimited. Bytes are charged after they are pulled from the source, at
+  most one ~100ms quantum (1KiB..32KiB) ahead of the wait, so the long-run
+  sum across workers and parts stays at the cap. Uploads are not charged a
+  second time. Context cancel unblocks a waiter and drops that reservation
+  when it is still the tail of the timeline. The bucket only slows reads;
+  it does not overwrite or delete. Buckets are copied one at a time, so
+  the migrator's bucket is the process-wide cap.
 
 #### Per-object pipeline (`handle`)
 
@@ -284,8 +300,8 @@ is crash-safe; restart simply continues appending.
 
 - `cobra` provides subcommands and bilingual help.
 - Persistent flags: `-c/--config`, `--bucket`, `--workers`,
-  `--multipart-concurrency`. Priority is CLI, then environment, then YAML,
-  then the built-in default.
+  `--multipart-concurrency`, `--rate-limit`. Priority is CLI, then
+  environment, then YAML, then the built-in default.
 - `signalCtx` wires `SIGINT` / `SIGTERM` to context cancellation. The first
   signal cancels the worker pool (in-flight multipart uploads are aborted,
   not deleted); a second signal calls `os.Exit(130)`.

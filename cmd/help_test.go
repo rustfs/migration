@@ -29,6 +29,10 @@ func TestRootHelpBilingual(t *testing.T) {
 		"status",
 		"--workers",
 		"--multipart-concurrency",
+		"--rate-limit",
+		"RATE_LIMIT",
+		"20M",
+		"20MiB",
 		"WORKERS",
 		"扫描始终单线程",
 	} {

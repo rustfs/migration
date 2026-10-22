@@ -29,6 +29,7 @@ var (
 	diffExtra         bool
 	workersFlag       int
 	multipartConcFlag int
+	rateLimitFlag     string
 )
 
 func Execute() error {
@@ -48,6 +49,7 @@ func NewRoot() *cobra.Command {
 	root.PersistentFlags().StringVar(&bucketFlag, "bucket", "", "bucket name (empty = all) / 桶名（空=全部）")
 	root.PersistentFlags().IntVar(&workersFlag, "workers", 0, "concurrent objects for run/migrate/diff, overrides YAML (must be >= 1) / 对象并发数，覆盖配置，须 >= 1")
 	root.PersistentFlags().IntVar(&multipartConcFlag, "multipart-concurrency", 0, "parallel parts per large object, overrides YAML (must be >= 1) / 单个大对象的分片并发，覆盖配置，须 >= 1")
+	root.PersistentFlags().StringVar(&rateLimitFlag, "rate-limit", "", "aggregate source-read cap for run/migrate, e.g. 20M or 20MiB; 0 = unlimited / 所有 worker 从源读取的合计上限，例如 20M 或 20MiB；0 表示不限速")
 	root.CompletionOptions.DisableDefaultCmd = true
 
 	root.AddCommand(listCmd())
@@ -89,6 +91,9 @@ func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 		cmd.Flags().Changed("workers"),
 		cmd.Flags().Changed("multipart-concurrency"),
 	); err != nil {
+		return nil, err
+	}
+	if err := cfg.ApplyRateLimitOverride(rateLimitFlag, cmd.Flags().Changed("rate-limit")); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -298,7 +303,7 @@ func forEachBucket(cmd *cobra.Command, needTarget bool, fn func(ctx context.Cont
 	if err != nil {
 		return err
 	}
-	log.Printf("buckets=%d  %s → %s  workers=%d", len(names), cfg.Old.Endpoint, cfg.New.Endpoint, cfg.Workers)
+	log.Printf("buckets=%d  %s → %s  workers=%d  rate_limit=%s", len(names), cfg.Old.Endpoint, cfg.New.Endpoint, cfg.Workers, cfg.RateLimit)
 	var failed []string
 	for _, name := range names {
 		if err := ctx.Err(); err != nil {
@@ -364,8 +369,8 @@ func migrateOne(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Clie
 		return err
 	}
 	defer m.Close()
-	log.Printf("migrate: bucket=%s workers=%d threshold=%dMiB partSize=%dMiB partConcurrency=%d",
-		bucket, cfg.Workers, cfg.MultipartThreshold>>20, cfg.MultipartPartSize>>20, cfg.MultipartConcurrency)
+	log.Printf("migrate: bucket=%s workers=%d rate_limit=%s threshold=%dMiB partSize=%dMiB partConcurrency=%d",
+		bucket, cfg.Workers, cfg.RateLimit, cfg.MultipartThreshold>>20, cfg.MultipartPartSize>>20, cfg.MultipartConcurrency)
 	return m.Run(ctx)
 }
 

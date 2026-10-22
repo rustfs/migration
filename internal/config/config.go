@@ -40,6 +40,12 @@ type Config struct {
 	MultipartThreshold   int64 `yaml:"multipart_threshold"`
 	MultipartPartSize    int64 `yaml:"multipart_part_size"`
 	MultipartConcurrency int   `yaml:"multipart_concurrency"`
+
+	// RateLimit is the aggregate source-read cap in bytes per second, shared
+	// by every copy worker (including multipart parts). 0 means unlimited.
+	// YAML 0 and a missing field both stay unlimited; this is not rewritten
+	// to a default the way workers is.
+	RateLimit ByteRate `yaml:"rate_limit"`
 }
 
 // MinMultipartPartSize is the S3 minimum for every part except the last
@@ -78,6 +84,9 @@ func Load(path string) (*Config, error) {
 	if err := c.validateMultipartPartSize(); err != nil {
 		return nil, err
 	}
+	if err := c.ValidateRateLimit(); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -109,6 +118,9 @@ func (c *Config) applyEnv() error {
 	if err := applyPositiveIntEnv(&c.MultipartConcurrency, "MULTIPART_CONCURRENCY"); err != nil {
 		return err
 	}
+	if err := applyByteRateEnv(&c.RateLimit, "RATE_LIMIT"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -128,6 +140,22 @@ func applyPositiveIntEnv(dst *int, key string) error {
 		return fmt.Errorf("env %s must be >= 1, got %d", key, n)
 	}
 	*dst = n
+	return nil
+}
+
+// applyByteRateEnv overrides dst when key is set. Empty means "leave YAML".
+// 0 is a real value (unlimited) and replaces a YAML cap. Negative values and
+// unknown suffixes are rejected.
+func applyByteRateEnv(dst *ByteRate, key string) error {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	n, err := ParseByteRate(raw)
+	if err != nil {
+		return fmt.Errorf("env %s: %w", key, err)
+	}
+	*dst = ByteRate(n)
 	return nil
 }
 
@@ -159,6 +187,7 @@ func (c *Config) applyDefaults() {
 	if c.MultipartConcurrency == 0 {
 		c.MultipartConcurrency = DefaultMultipartConcurrency
 	}
+	// RateLimit 0 (omitted) stays 0: unlimited. Do not invent a default cap.
 	if c.SpoolDir == "" {
 		c.SpoolDir = filepath.Dir(c.DBPath)
 	}
@@ -260,6 +289,28 @@ func (c *Config) ApplyConcurrencyOverrides(workers, multipart int, workersSet, m
 		c.MultipartConcurrency = multipart
 	}
 	return c.ValidateConcurrency()
+}
+
+// ValidateRateLimit rejects a negative cap. Zero is unlimited.
+func (c *Config) ValidateRateLimit() error {
+	if c.RateLimit < 0 {
+		return fmt.Errorf("rate_limit must be >= 0, got %d", int64(c.RateLimit))
+	}
+	return nil
+}
+
+// ApplyRateLimitOverride replaces the aggregate byte cap when --rate-limit
+// was explicitly set. Priority is CLI > env > YAML > default (unlimited).
+// 0 means unlimited, including on the CLI.
+func (c *Config) ApplyRateLimitOverride(raw string, set bool) error {
+	if set {
+		n, err := ParseByteRate(raw)
+		if err != nil {
+			return fmt.Errorf("rate_limit: %w", err)
+		}
+		c.RateLimit = ByteRate(n)
+	}
+	return c.ValidateRateLimit()
 }
 
 // MaxInFlight estimates per-host request fan-out: each worker may have

@@ -22,6 +22,7 @@ const batchSize = 500
 // Listing stays single-threaded on purpose: each page needs the previous
 // continuation token, and the rows land in one SQLite file. Object
 // concurrency (workers) applies to copy and diff, not to scan.
+// rate_limit applies to copy body reads only.
 func Run(ctx context.Context, cli *s3.Client, bucket string, st *store.Store) (int64, error) {
 	if err := cluster.HeadBucket(ctx, cli, bucket); err != nil {
 		return 0, err

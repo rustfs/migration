@@ -6,7 +6,7 @@
 #   OLD_ENDPOINT OLD_AK OLD_SK OLD_REGION
 #   NEW_ENDPOINT NEW_AK NEW_SK NEW_REGION REGION
 #   BUCKET DB_PATH CONFLICT_LOG SPOOL_DIR
-#   WORKERS MULTIPART_CONCURRENCY
+#   WORKERS MULTIPART_CONCURRENCY RATE_LIMIT
 
 old:
   endpoint: "http://10.0.0.1:9000"     # source / 来源（只读）
@@ -37,8 +37,8 @@ spool_dir: ""
 # 命令行覆盖：--workers 32 。环境变量：WORKERS（覆盖本文件，但命令行优先）。
 # 小文件很多、源和代理都吃得消时再加大；出现 503、超时就减小。
 # 排错可以临时 --workers 1，等价于串行复制。
-# 没有 bandwidth、rate_limit 或 MB/s 字段。峰值大约是 workers × multipart_concurrency。
-# 先调小并发，再看 status 和网卡，留出 HAProxy maxconn 余量。
+# 在途请求峰值大约是 workers × multipart_concurrency。字节速率另见下面的 rate_limit。
+# 代理返回 503 时先调小并发，再看 status 和网卡，留出 HAProxy maxconn 余量。
 workers: 16
 
 # 对象大小 >= 该字节数时走分片上传。省略或 0 = 50MiB。
@@ -56,3 +56,19 @@ multipart_part_size: 16777216   # 16 MiB
 # 峰值约 workers × multipart_concurrency 个打到同一集群的在途请求。
 # 例：16 × 4 = 64。代理 maxconn、源盘和目标盘都要撑得住这个乘积。
 multipart_concurrency: 4
+
+# 带宽上限：所有 worker（含同一个大对象里的分片）从源读取的合计字节/秒。
+# 省略或写 0 = 不限速。命令行、环境变量里的 0 同样是不限速（和 workers 不同：
+# workers 的 0 在 YAML 里表示默认 16，在命令行里会报错）。
+# 优先级：--rate-limit > 环境变量 RATE_LIMIT > 本文件 > 默认不限速。
+#
+# 单位一定要看清。M 是十进制 MB，Mi 才是 1024 进制的 MiB：
+#   20M / 20MB   = 20 × 1000 × 1000 = 20000000 字节/秒
+#   30M          = 30000000 字节/秒
+#   50M / 50MB   = 50000000 字节/秒
+#   20Mi / 20MiB = 20 × 1024 × 1024 = 20971520 字节/秒
+# 裸数字表示字节/秒，例如 1048576。大小写不敏感，可以加 /s。
+# K/KB=1000，Ki/KiB=1024；G/GB=1000³，Gi/GiB=1024³。
+# 只限制 run / migrate 复制对象正文。scan / diff / list 不读正文，不受影响。
+# 生产时段示例：rate_limit: 20M 。确认不影响业务后再调到 30M 或 50M。
+rate_limit: 0

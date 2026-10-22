@@ -29,7 +29,18 @@ Concurrency / 并发:
   CLI: --workers N   --multipart-concurrency N
   Env: WORKERS       MULTIPART_CONCURRENCY
   Priority / 优先级: CLI > env > YAML > default
-                     命令行 > 环境变量 > 配置文件 > 默认值`
+                     命令行 > 环境变量 > 配置文件 > 默认值
+
+Bandwidth / 带宽:
+  rate_limit              aggregate bytes read from the source per second
+                          所有 worker（含大对象分片）从源读取的合计上限
+  0 or omit = unlimited. Applies to run / migrate object bodies only.
+  0 或省略 = 不限速。只作用于 run / migrate 的对象正文。
+  20M / 20MB  = 20×1000×1000 B/s (decimal MB, not 1024)
+  20Mi / 20MiB = 20×1024×1024 B/s (binary MiB)
+  20M / 20MB 是十进制，每秒 20×1000×1000 字节；20Mi / 20MiB 才是 1024 进制。
+  CLI: --rate-limit 20M     Env: RATE_LIMIT
+  Same priority / 同样的优先级: CLI > env > YAML > default`
 
 const listShort = `List buckets on the source / 列出源集群上的桶`
 const listLong = `List every bucket on the source endpoint (read-only).
@@ -47,16 +58,20 @@ does not yet exist on the target. Resumable. Never overwrites.
 
 --workers controls how many objects are copied at once.
 --multipart-concurrency controls parts inside one large object.
-Scan itself stays single-threaded.
+--rate-limit caps the total bytes/sec those workers read from the source.
+Scan itself stays single-threaded and is not rate limited.
 
 --workers 控制同时复制多少个对象。
 --multipart-concurrency 控制单个大对象内部的分片并发。
-扫描阶段本身是单线程的。
+--rate-limit 限制这些 worker 从源读取的合计字节每秒。
+扫描阶段本身是单线程的，也不吃带宽限额。
+20M = 20×1000×1000 B/s；20MiB = 20×1024×1024 B/s；0 = 不限速。
 
 Examples:
   migration run -c config.yaml
   migration run -c config.yaml --bucket photos --workers 32
-  migration run -c config.yaml --multipart-concurrency 8`
+  migration run -c config.yaml --multipart-concurrency 8
+  migration run -c config.yaml --workers 16 --rate-limit 20M`
 
 const scanShort = `Inventory source objects into SQLite / 扫描源对象到本地 SQLite`
 const scanLong = `Walk ListObjectsV2 on the source and upsert {key,size,mtime,etag} locally.
@@ -84,10 +99,13 @@ conflict.log and left untouched.
 conflict.log，不覆盖。
 
 --workers is the object pool. --multipart-concurrency is per large object.
+--rate-limit is the shared source-read cap across that pool (0 = unlimited).
 --workers 是对象并发。--multipart-concurrency 是单个大对象的分片并发。
+--rate-limit 是这个池子从源读取的合计上限（0 = 不限速）。
+20M = 20×1000×1000 B/s；20MiB = 20×1024×1024 B/s。
 
 Example:
-  migration migrate -c config.yaml --workers 8`
+  migration migrate -c config.yaml --workers 8 --rate-limit 30M`
 
 const statusShort = `Show local progress counters / 显示本地进度`
 const statusLong = `Print per-bucket counters from the local state DB(s). No S3 calls.
@@ -122,10 +140,16 @@ Concurrency / 并发:
   --multipart-concurrency N     parts in parallel inside one large object (default 4)
                                 单个大对象的分片并发，默认 4
   Scan is single-threaded / 扫描（scan）始终单线程，不受 --workers 影响
+Bandwidth / 带宽:
+  --rate-limit SIZE             shared source-read cap for run/migrate (default unlimited)
+                                run/migrate 从源读取的合计上限，默认不限速
+                                20M/30M/50M = decimal MB/s (×1000×1000)
+                                20MiB = binary MiB/s (×1024×1024); 0 = unlimited
+                                20M 是十进制 MB/s；20MiB 才是 1024 进制；0 = 不限速
   Priority / 优先级: CLI > env > YAML > default
                      命令行 > 环境变量 > 配置文件 > 默认值
 Env overrides / 环境变量覆盖:
   OLD_ENDPOINT OLD_AK OLD_SK OLD_REGION
   NEW_ENDPOINT NEW_AK NEW_SK NEW_REGION
   BUCKET DB_PATH CONFLICT_LOG SPOOL_DIR REGION
-  WORKERS MULTIPART_CONCURRENCY`
+  WORKERS MULTIPART_CONCURRENCY RATE_LIMIT`
