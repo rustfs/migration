@@ -29,6 +29,10 @@ go build -o bin/migration .
 
 Leave `bucket:` empty to migrate **every** source bucket. `--bucket NAME` pins one.
 
+There is no MB/s rate limit (`bandwidth` / `rate_limit` are not settings). Load is `workers` (default 16) and `multipart_concurrency` (default 4); peak is about `workers × multipart_concurrency`. Lower those, then watch `status` and the NIC. Stay under HAProxy `maxconn`. See [docs/使用手册.md](docs/使用手册.md) §9.1 and [docs/USAGE.md](docs/USAGE.md).
+
+没有 MB/s 限速字段。负载由 `workers`（默认 16）和 `multipart_concurrency`（默认 4）决定，峰值大约是二者相乘。要降负载就调小它们，再看 `status` 和网卡，并留出 HAProxy `maxconn` 余量。详见手册 §9.1。
+
 Safety model: `HeadObject` on the target before any write. A matching object (same size and comparable ETag) is `done`; mismatches go to `conflict.log` and are never overwritten. Multipart for large objects. SQLite WAL per object. Re-run after Ctrl-C.
 
 See `migration <command> --help` for bilingual (English + 中文) help.
