@@ -14,5 +14,6 @@ cp config.example.yaml config.yaml
 - `run` = scan + copy. `scan` / `migrate` stay available separately.
 - `diff` HEADs the target for every source key; exit 1 if anything is missing or mismatched.
 - Never overwrites. Never deletes. Re-run after Ctrl-C.
+- `multipart_part_size` must be at least 5 MiB (5242880). S3 rejects a smaller non-final part with `EntityTooSmall`. The 16 MiB default is unchanged. A smaller configured value fails at config load and is not clamped upward.
 
 Safety, state machine, tuning and troubleshooting: see the Chinese manual and `docs/DESIGN.md`.
