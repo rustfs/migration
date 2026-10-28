@@ -29,6 +29,6 @@ go build -o bin/migration .
 
 Leave `bucket:` empty to migrate **every** source bucket. `--bucket NAME` pins one.
 
-Safety model: `HeadObject` on the target before any write; conflicts go to `conflict.log`. Multipart for large objects. SQLite WAL per object. Re-run after Ctrl-C.
+Safety model: `HeadObject` on the target before any write. A matching object (same size and comparable ETag) is `done`; mismatches go to `conflict.log` and are never overwritten. Multipart for large objects. SQLite WAL per object. Re-run after Ctrl-C.
 
 See `migration <command> --help` for bilingual (English + 中文) help.

@@ -143,14 +143,14 @@ Pragmas applied at open: `journal_mode=WAL`, `synchronous=NORMAL`,
 Per-object state machine:
 
 ```
-        ┌──────────┐  (HEAD-New exists)
+        ┌──────────┐  (HEAD-New exists, size or comparable ETag differs)
         │ pending  │ ──────────────────────▶  conflict   (terminal)
         └────┬─────┘
              │  (GET-Old 404)
              ▼
         skipped (terminal)
              │
-             │  (copy OK + verified)
+             │  (copy OK + verified, or HEAD-New already matches inventory)
              ▼
         done    (terminal)
              │
@@ -192,7 +192,8 @@ Old is retried.
 
 ```
 HEAD(New)
-  ├─ 200 OK  ─────────▶  write conflict.log, mark conflict, return
+  ├─ 200 and matches inventory ─▶ mark done (already present), return
+  ├─ 200 otherwise ────▶  write conflict.log, mark conflict, return
   ├─ 404      ──┐
   └─ other err └────▶   mark failed, return
                 │
@@ -306,7 +307,8 @@ independently.
 | ---------------------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------- |
 | Old returns transient 5xx                | SDK error                          | Mark `failed`; retried on the next `migrate` run.                                       |
 | Old returns 404 (`NoSuchKey`)            | `errors.As` on typed error         | Mark `skipped`; **not** treated as an error.                                            |
-| New `HeadObject` returns 200             | nil error from HEAD                | Conflict path; never write; append to `conflict.log`.                                   |
+| New `HeadObject` returns 200 and matches inventory size and comparable ETag | nil error from HEAD | Mark `done`; do not write. Covers a PUT that landed before a cancelled `MarkStatus(done)`. |
+| New `HeadObject` returns 200 but size or comparable ETag differs | nil error from HEAD | Conflict path; never write; append to `conflict.log`. |
 | New `PutObject` / `UploadPart` fails     | SDK error                          | Abort any active multipart, mark `failed`, retry on next run.                           |
 | SQLite or `conflict.log` write fails     | local I/O error                    | First fatal error wins; worker ctx cancelled; command exits non-zero.                   |
 | Partial multipart on crash               | `migrate` re-run                   | Row is still `pending` / `failed`; new `CreateMultipartUpload` starts fresh; orphaned session is GC'd by RustFS lifecycle. |
@@ -352,6 +354,11 @@ The repository ships with several test layers:
      multipart, metadata, no `CopyObject` / `DeleteObject`.
    - `TestResumeAfterTransientFailure`: 5xx on `UploadPart`, resume without
      re-uploading completed objects.
+   - `TestIdenticalTargetIsDoneDifferentContentConflicts`: identical target
+     is `done`; same size with a different ETag, or a different size, stays
+     `conflict` and is not overwritten.
+   - `TestResumeAfterPutBeforeMarkDone`: PUT committed while the row is still
+     `failed` resumes as `done`.
    - `TestSkippedObjectRescannedAndCopied`: skipped objects that reappear are
      retried.
    - `TestCreateMissingTargetBucket`: `CreateBucket` on an empty target.

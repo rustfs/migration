@@ -191,6 +191,12 @@ func (m *Migrator) handle(ctx context.Context, obj store.Object) error {
 	})
 	switch {
 	case err == nil:
+		// A cancelled run can leave PutObject committed and the row still
+		// failed/pending. If the target already matches the inventory, this
+		// is a resume, not a conflict. Never overwrite either way.
+		if targetAlreadyMigrated(obj, newHead) {
+			return m.markDone(obj)
+		}
 		var newLM time.Time
 		if newHead.LastModified != nil {
 			newLM = *newHead.LastModified
@@ -221,6 +227,10 @@ func (m *Migrator) handle(ctx context.Context, obj store.Object) error {
 		return m.markFailed(obj.Key, err)
 	}
 
+	return m.markDone(obj)
+}
+
+func (m *Migrator) markDone(obj store.Object) error {
 	m.copied.Add(1)
 	if obj.Size > 0 {
 		m.bytes.Add(obj.Size)
@@ -500,7 +510,25 @@ func copyMetadata(src map[string]string) map[string]string {
 }
 
 func normalizeETag(s string) string { return strings.Trim(s, `"`) }
+
+// isMultipartETag reports S3 multipart ETags, which look like "<md5>-<parts>".
 func isMultipartETag(s string) bool { return strings.Contains(s, "-") }
+
+// targetAlreadyMigrated is true when the object already on the target is the
+// one recorded at scan time. Size must match. ETags are compared only when
+// both sides have one and neither is multipart: multipart ETags depend on
+// part boundaries and are not comparable across a copy.
+func targetAlreadyMigrated(obj store.Object, head *s3.HeadObjectOutput) bool {
+	if head == nil || deref(head.ContentLength) != obj.Size {
+		return false
+	}
+	srcETag := normalizeETag(obj.ETag)
+	dstETag := normalizeETag(awsv2.ToString(head.ETag))
+	if srcETag != "" && dstETag != "" && !isMultipartETag(srcETag) && !isMultipartETag(dstETag) {
+		return srcETag == dstETag
+	}
+	return true
+}
 
 type conflictWriter struct {
 	mu sync.Mutex

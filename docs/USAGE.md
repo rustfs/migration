@@ -14,5 +14,6 @@ cp config.example.yaml config.yaml
 - `run` = scan + copy. `scan` / `migrate` stay available separately.
 - `diff` HEADs the target for every source key; exit 1 if anything is missing or mismatched.
 - Never overwrites. Never deletes. Re-run after Ctrl-C.
+- A target object that already matches the inventory (same size; same ETag when both are present and neither is a multipart ETag `hash-N`) is marked `done`, not `conflict`. A different size or comparable ETag is still a conflict and is never overwritten. A Ctrl-C after a successful PUT therefore resumes as `done` instead of a false conflict.
 
 Safety, state machine, tuning and troubleshooting: see the Chinese manual and `docs/DESIGN.md`.

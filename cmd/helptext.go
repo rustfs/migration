@@ -51,9 +51,13 @@ Example:
 
 const migrateShort = `Copy pending objects (never overwrites) / 复制待迁移对象（永不覆盖）`
 const migrateLong = `Copy every SQLite row in pending/failed. If the key already exists on
-the target, it is logged to conflict.log and skipped.
+the target and matches the inventoried size (and single-part ETag, when both
+sides have one), it is marked done. A different object is logged to
+conflict.log and left untouched.
 
-复制 SQLite 中 pending/failed 的对象。目标已有同名 key 时写入 conflict.log 并跳过。
+复制 SQLite 中 pending/failed 的对象。目标已有同名 key 且与清单大小一致
+（两边都有非分片 ETag 时 ETag 也须一致）则记为 done。不一致则写入
+conflict.log，不覆盖。
 
 Example:
   migration migrate -c config.yaml`
