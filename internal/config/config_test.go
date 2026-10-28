@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -140,6 +142,70 @@ old: {endpoint: "http://a:1", access_key: a, secret_key: b}
 	if err := cfg.ValidatePair(); err == nil {
 		t.Fatal("expected pair validation to fail")
 	}
+}
+
+func TestMultipartPartSizeMinimum(t *testing.T) {
+	const base = `
+old:
+  endpoint: "http://old:9000"
+  access_key: a
+  secret_key: b
+new:
+  endpoint: "http://new:9000"
+  access_key: c
+  secret_key: d
+`
+
+	t.Run("default stays 16MiB", func(t *testing.T) {
+		for _, body := range []string{base, base + "multipart_part_size: 0\n"} {
+			cfg := loadPartSizeYAML(t, body)
+			if cfg.MultipartPartSize != 16*1024*1024 {
+				t.Fatalf("default part size = %d, want %d", cfg.MultipartPartSize, 16*1024*1024)
+			}
+		}
+	})
+
+	t.Run("explicit value at or above minimum is kept", func(t *testing.T) {
+		cfg := loadPartSizeYAML(t, base+"multipart_part_size: 5242880\n")
+		if cfg.MultipartPartSize != MinMultipartPartSize {
+			t.Fatalf("part size = %d, want %d", cfg.MultipartPartSize, MinMultipartPartSize)
+		}
+		cfg = loadPartSizeYAML(t, base+"multipart_part_size: 16777216\n")
+		if cfg.MultipartPartSize != 16*1024*1024 {
+			t.Fatalf("part size = %d, want 16MiB", cfg.MultipartPartSize)
+		}
+	})
+
+	t.Run("below 5MiB fails load", func(t *testing.T) {
+		for _, size := range []int64{1, 1024 * 1024, MinMultipartPartSize - 1} {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			body := base + "multipart_part_size: " + strconv.FormatInt(size, 10) + "\n"
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("part size %d: expected error", size)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "5242880") || !strings.Contains(msg, "EntityTooSmall") {
+				t.Fatalf("part size %d: error %q missing minimum or EntityTooSmall", size, msg)
+			}
+		}
+	})
+}
+
+func loadPartSizeYAML(t *testing.T, body string) *Config {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
 }
 
 func TestApplyBucketFlag(t *testing.T) {
