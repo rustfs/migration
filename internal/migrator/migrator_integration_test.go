@@ -406,6 +406,121 @@ func TestResumeAfterPutBeforeMarkDone(t *testing.T) {
 	}
 }
 
+func TestCanceledMultipartGetIsFailedNotSkipped(t *testing.T) {
+	ctx := context.Background()
+	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
+	body := bytes.Repeat([]byte("abcd"), 8) // 32 bytes; test part size is 4
+
+	oldS3 := fakes3.NewWithObjects(t, "bucket", map[string][]byte{
+		"wide.bin": body,
+	}, lm)
+	defer oldS3.Close()
+	newS3 := fakes3.NewWithObjects(t, "bucket", map[string][]byte{}, lm)
+	defer newS3.Close()
+
+	oldClient := newTestClient(t, ctx, oldS3.URL)
+	newClient := newTestClient(t, ctx, newS3.URL)
+	tmp := t.TempDir()
+	dbPath := path.Join(tmp, "migration.db")
+	conflictPath := path.Join(tmp, "conflict.log")
+	st, err := store.Open(dbPath, "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := scanner.Run(ctx, oldClient, "bucket", st); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	oldS3.BlockGetsUntilCancel(started)
+	// AbortMultipartUpload answers 404 NoSuchUpload. That text used to make
+	// IsNotFound true via "StatusCode: 404" / "NotFound" even though the
+	// GetObject itself was canceled and the source object still exists.
+	oldS3.SetFailAborts(8)
+
+	cfg := testCfg(dbPath, conflictPath, tmp)
+	cfg.Workers = 1
+	m, err := New(cfg, oldClient, newClient, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- m.Run(runCtx)
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for GetObject")
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("migrate did not return after cancel")
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	counts, err := st.Counts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Failed != 1 || counts.Skipped != 0 || counts.Done != 0 || counts.Total != 1 {
+		t.Fatalf("canceled get counts: %+v", counts)
+	}
+	status, lastErr, _, _ := objectRow(t, dbPath, "wide.bin")
+	if status != store.StatusFailed || lastErr == "source 404" {
+		t.Fatalf("status=%s last_error=%q", status, lastErr)
+	}
+	if !strings.Contains(strings.ToLower(lastErr), "cancel") {
+		t.Fatalf("expected a cancellation error, got %q", lastErr)
+	}
+	if _, ok := newS3.Object("bucket", "wide.bin"); ok {
+		t.Fatal("canceled copy wrote the target object")
+	}
+	if src, ok := oldS3.Object("bucket", "wide.bin"); !ok || !bytes.Equal(src, body) {
+		t.Fatal("source object missing after cancel")
+	}
+	if newS3.CopyObjectCalls() != 0 || newS3.DeleteObjectCalls() != 0 || oldS3.DeleteObjectCalls() != 0 {
+		t.Fatalf("unsafe API usage oldDelete=%d newDelete=%d newCopy=%d",
+			oldS3.DeleteObjectCalls(), newS3.DeleteObjectCalls(), newS3.CopyObjectCalls())
+	}
+
+	oldS3.StopBlockingGets()
+	oldS3.SetFailAborts(0)
+	m2, err := New(cfg, oldClient, newClient, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m2.Close()
+	if err := m2.Run(ctx); err != nil {
+		t.Fatalf("retry migrate: %v", err)
+	}
+	counts, err = st.Counts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Done != 1 || counts.Failed != 0 || counts.Skipped != 0 {
+		t.Fatalf("retry counts: %+v", counts)
+	}
+	assertObject(t, newS3, "wide.bin", body)
+	if got := newS3.CompleteMultipartCalls("wide.bin"); got != 1 {
+		t.Fatalf("complete calls=%d", got)
+	}
+	if got := newS3.PutObjectCalls("wide.bin"); got != 0 {
+		t.Fatalf("multipart object was PutObject'd: %d", got)
+	}
+}
+
 func TestCreateMissingTargetBucket(t *testing.T) {
 	ctx := context.Background()
 	lm := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)

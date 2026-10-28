@@ -200,7 +200,8 @@ HEAD(New)
                 ▼
          GetObject(Old)
                 │
-                ├─ NoSuchKey/404 ─▶ log WARN, mark skipped, return
+                ├─ NoSuchKey/404, request finished ─▶ log WARN, mark skipped, return
+                ├─ cancel / deadline / request canceled ─▶ mark failed, return
                 └─ other err      ─▶ mark failed, return
                 │
                 ▼
@@ -307,6 +308,7 @@ independently.
 | ---------------------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------- |
 | Old returns transient 5xx                | SDK error                          | Mark `failed`; retried on the next `migrate` run.                                       |
 | Old returns 404 (`NoSuchKey`)            | `errors.As` on typed error         | Mark `skipped`; **not** treated as an error.                                            |
+| Context canceled, deadline, or request canceled during Get/Upload, even if the text contains `NotFound` or `StatusCode: 404` | Checked before `IsNotFound` | Mark `failed`. A multipart abort's `NoSuchUpload` is not a missing source object. The next `migrate` retries. |
 | New `HeadObject` returns 200 and matches inventory size and comparable ETag | nil error from HEAD | Mark `done`; do not write. Covers a PUT that landed before a cancelled `MarkStatus(done)`. |
 | New `HeadObject` returns 200 but size or comparable ETag differs | nil error from HEAD | Conflict path; never write; append to `conflict.log`. |
 | New `PutObject` / `UploadPart` fails     | SDK error                          | Abort any active multipart, mark `failed`, retry on next run.                           |
