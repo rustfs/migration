@@ -3,6 +3,7 @@ package migrator
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"os"
 	"path"
 	"strings"
@@ -240,6 +241,171 @@ func TestSkippedObjectRescannedAndCopied(t *testing.T) {
 	assertObject(t, newS3, "reappear.txt", []byte("v2"))
 }
 
+func TestIdenticalTargetIsDoneDifferentContentConflicts(t *testing.T) {
+	ctx := context.Background()
+	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
+	identical := bytes.Repeat([]byte("a"), 1024)
+	sourceClash := bytes.Repeat([]byte("b"), 1024)
+	destClash := bytes.Repeat([]byte("c"), 1024)
+	sourceSmall := []byte("short")
+	destLarge := []byte("much-longer-than-source")
+
+	oldS3 := fakes3.NewWithObjects(t, "bucket", map[string][]byte{
+		"resume/same.dat":  identical,
+		"resume/clash.dat": sourceClash,
+		"resume/size.dat":  sourceSmall,
+	}, lm)
+	defer oldS3.Close()
+	newS3 := fakes3.NewWithObjects(t, "bucket", map[string][]byte{
+		"resume/same.dat":  identical,
+		"resume/clash.dat": destClash,
+		"resume/size.dat":  destLarge,
+	}, lm.Add(time.Hour))
+	defer newS3.Close()
+
+	oldClient := newTestClient(t, ctx, oldS3.URL)
+	newClient := newTestClient(t, ctx, newS3.URL)
+	tmp := t.TempDir()
+	dbPath := path.Join(tmp, "migration.db")
+	conflictPath := path.Join(tmp, "conflict.log")
+	st, err := store.Open(dbPath, "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := scanner.Run(ctx, oldClient, "bucket", st); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testCfg(dbPath, conflictPath, tmp)
+	m, err := New(cfg, oldClient, newClient, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	counts, err := st.Counts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Total != 3 || counts.Done != 1 || counts.Conflict != 2 || counts.Failed != 0 {
+		t.Fatalf("unexpected counts: %+v", counts)
+	}
+	if m.copied.Load() != 1 || m.conflicts.Load() != 2 || m.bytes.Load() != int64(len(identical)) {
+		t.Fatalf("counters copied=%d conflicts=%d bytes=%d", m.copied.Load(), m.conflicts.Load(), m.bytes.Load())
+	}
+
+	status, lastErr, _, _ := objectRow(t, dbPath, "resume/same.dat")
+	if status != store.StatusDone || lastErr != "" {
+		t.Fatalf("identical target status=%s last_error=%q", status, lastErr)
+	}
+	for _, key := range []string{"resume/clash.dat", "resume/size.dat"} {
+		status, lastErr, _, _ := objectRow(t, dbPath, key)
+		if status != store.StatusConflict || lastErr != "exists on new" {
+			t.Fatalf("%s status=%s last_error=%q", key, status, lastErr)
+		}
+	}
+
+	assertObject(t, newS3, "resume/same.dat", identical)
+	assertObject(t, newS3, "resume/clash.dat", destClash)
+	assertObject(t, newS3, "resume/size.dat", destLarge)
+	if newS3.PutObjectCalls("resume/same.dat") != 0 || newS3.PutObjectCalls("resume/clash.dat") != 0 || newS3.PutObjectCalls("resume/size.dat") != 0 {
+		t.Fatalf("existing targets were written: same=%d clash=%d size=%d",
+			newS3.PutObjectCalls("resume/same.dat"), newS3.PutObjectCalls("resume/clash.dat"), newS3.PutObjectCalls("resume/size.dat"))
+	}
+	if newS3.CopyObjectCalls() != 0 || newS3.DeleteObjectCalls() != 0 {
+		t.Fatalf("unsafe API usage copy=%d delete=%d", newS3.CopyObjectCalls(), newS3.DeleteObjectCalls())
+	}
+
+	conflicts, err := os.ReadFile(conflictPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(conflicts)
+	if strings.Contains(logText, "resume/same.dat") {
+		t.Fatalf("identical object recorded as conflict: %q", logText)
+	}
+	if !strings.Contains(logText, "resume/clash.dat") || !strings.Contains(logText, "resume/size.dat") {
+		t.Fatalf("conflict log missing mismatched keys: %q", logText)
+	}
+}
+
+func TestResumeAfterPutBeforeMarkDone(t *testing.T) {
+	ctx := context.Background()
+	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
+	body := bytes.Repeat([]byte{0xab}, 1024)
+
+	oldS3 := fakes3.NewWithObjects(t, "bucket", map[string][]byte{
+		"resume/a.dat": body,
+	}, lm)
+	defer oldS3.Close()
+	newS3 := fakes3.NewWithObjects(t, "bucket", map[string][]byte{}, lm)
+	defer newS3.Close()
+
+	oldClient := newTestClient(t, ctx, oldS3.URL)
+	newClient := newTestClient(t, ctx, newS3.URL)
+	tmp := t.TempDir()
+	dbPath := path.Join(tmp, "migration.db")
+	conflictPath := path.Join(tmp, "conflict.log")
+	st, err := store.Open(dbPath, "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := scanner.Run(ctx, oldClient, "bucket", st); err != nil {
+		t.Fatal(err)
+	}
+
+	// SIGINT after PutObject committed and before MarkStatus(done): the
+	// target has the object, SQLite still says failed.
+	newS3.Put("bucket", "resume/a.dat", body, lm, fakes3.Metadata{
+		ContentType: "application/test",
+		Metadata:    map[string]string{"origin": "old"},
+	})
+	if err := st.MarkStatus("resume/a.dat", store.StatusFailed, "context canceled"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testCfg(dbPath, conflictPath, tmp)
+	m, err := New(cfg, oldClient, newClient, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	counts, err := st.Counts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Done != 1 || counts.Conflict != 0 || counts.Failed != 0 || counts.Total != 1 {
+		t.Fatalf("unexpected counts: %+v", counts)
+	}
+	status, lastErr, _, size := objectRow(t, dbPath, "resume/a.dat")
+	if status != store.StatusDone || lastErr != "" || size != 1024 {
+		t.Fatalf("status=%s last_error=%q size=%d", status, lastErr, size)
+	}
+	assertObject(t, newS3, "resume/a.dat", body)
+	if got := newS3.PutObjectCalls("resume/a.dat"); got != 0 {
+		t.Fatalf("resume re-uploaded resume/a.dat: puts=%d", got)
+	}
+	if m.copied.Load() != 1 || m.conflicts.Load() != 0 || m.bytes.Load() != 1024 {
+		t.Fatalf("counters copied=%d conflicts=%d bytes=%d", m.copied.Load(), m.conflicts.Load(), m.bytes.Load())
+	}
+	conflicts, err := os.ReadFile(conflictPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(conflicts)) != "" {
+		t.Fatalf("conflict log not empty: %q", conflicts)
+	}
+}
+
 func TestCreateMissingTargetBucket(t *testing.T) {
 	ctx := context.Background()
 	lm := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -322,6 +488,21 @@ func assertMissing(t *testing.T, f *fakes3.Server, key string) {
 	if got, ok := f.Object("bucket", key); ok {
 		t.Fatalf("object %s unexpectedly exists: %q", key, got)
 	}
+}
+
+func objectRow(t *testing.T, dbPath, key string) (status, lastErr, etag string, size int64) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	err = db.QueryRow(`SELECT status, COALESCE(last_error,''), COALESCE(etag,''), size FROM objects WHERE key = ?`, key).
+		Scan(&status, &lastErr, &etag, &size)
+	if err != nil {
+		t.Fatalf("row %s: %v", key, err)
+	}
+	return status, lastErr, etag, size
 }
 
 func assertMetadata(t *testing.T, f *fakes3.Server, key, contentType string, metadata map[string]string) {
