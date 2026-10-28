@@ -30,5 +30,5 @@ spool_dir: ""
 
 workers: 16                     # concurrent objects / 并发对象数
 multipart_threshold: 52428800   # 50 MiB
-multipart_part_size: 16777216   # 16 MiB
+multipart_part_size: 16777216   # 16 MiB. Must be >= 5 MiB (5242880); smaller values fail at load and are not raised. / 非末片至少 5 MiB，更小则加载失败，不会被改写
 multipart_concurrency: 4        # parts in parallel per large object / 大对象分片并发

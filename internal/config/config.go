@@ -32,6 +32,17 @@ type Config struct {
 	MultipartConcurrency int   `yaml:"multipart_concurrency"`
 }
 
+// MinMultipartPartSize is the S3 minimum for every part except the last
+// (5 MiB). RustFS and other S3-compatible targets reject a smaller non-final
+// part with EntityTooSmall.
+//
+// An undersized value fails at config load instead of being clamped. Other
+// knobs are filled in only when unset; none of them are rewritten. The
+// per-object adjustment that keeps an upload under 10 000 parts only grows
+// an already-valid part size, so it is not a reason to silently raise a
+// value the operator chose.
+const MinMultipartPartSize int64 = 5 * 1024 * 1024
+
 // Load parses YAML, applies env overrides and defaults. It does not require
 // every field: each command validates what it needs.
 func Load(path string) (*Config, error) {
@@ -47,6 +58,9 @@ func Load(path string) (*Config, error) {
 	c.applyDefaults()
 	c.normalize()
 	if err := c.ValidateNames(); err != nil {
+		return nil, err
+	}
+	if err := c.validateMultipartPartSize(); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -123,6 +137,13 @@ func (c *Config) normalize() {
 	c.New.SecretKey = strings.TrimSpace(c.New.SecretKey)
 	c.Old.Region = strings.TrimSpace(c.Old.Region)
 	c.New.Region = strings.TrimSpace(c.New.Region)
+}
+
+func (c *Config) validateMultipartPartSize() error {
+	if c.MultipartPartSize < MinMultipartPartSize {
+		return fmt.Errorf("multipart_part_size must be >= %d (5 MiB): non-final S3 parts smaller than that are rejected with EntityTooSmall (got %d)", MinMultipartPartSize, c.MultipartPartSize)
+	}
+	return nil
 }
 
 func (c *Config) ValidateNames() error {
