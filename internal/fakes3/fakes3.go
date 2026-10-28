@@ -31,19 +31,22 @@ type object struct {
 type Server struct {
 	*httptest.Server
 
-	mu              sync.Mutex
-	buckets         map[string]map[string]*object
-	created         map[string]time.Time
-	multipart       map[string]map[int][]byte
-	uploadBucket    map[string]string
-	uploadKey       map[string]string
-	uploadMeta      map[string]Metadata
-	nextUploadID    int
-	deleteCalls     int
-	copyCalls       int
-	putCalls        map[string]int
-	completeCalls   map[string]int
-	failPartUploads int
+	mu                   sync.Mutex
+	buckets              map[string]map[string]*object
+	created              map[string]time.Time
+	multipart            map[string]map[int][]byte
+	uploadBucket         map[string]string
+	uploadKey            map[string]string
+	uploadMeta           map[string]Metadata
+	nextUploadID         int
+	deleteCalls          int
+	copyCalls            int
+	putCalls             map[string]int
+	completeCalls        map[string]int
+	failPartUploads      int
+	failAborts           int
+	blockGetsUntilCancel bool
+	getStarted           chan struct{}
 }
 
 func New(t *testing.T) *Server {
@@ -158,6 +161,31 @@ func (s *Server) SetFailPartUploads(n int) {
 	s.failPartUploads = n
 }
 
+// BlockGetsUntilCancel makes GetObject wait until the caller cancels the
+// request context. started is closed when the first blocked GET is entered.
+func (s *Server) BlockGetsUntilCancel(started chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blockGetsUntilCancel = true
+	s.getStarted = started
+}
+
+// StopBlockingGets lets later GetObject calls complete normally.
+func (s *Server) StopBlockingGets() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blockGetsUntilCancel = false
+	s.getStarted = nil
+}
+
+// SetFailAborts makes the next n AbortMultipartUpload calls return 404
+// NoSuchUpload. The count is decremented on each abort.
+func (s *Server) SetFailAborts(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failAborts = n
+}
+
 func (s *Server) ensureBucketLocked(name string) {
 	if _, ok := s.buckets[name]; !ok {
 		s.buckets[name] = map[string]*object{}
@@ -202,7 +230,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && q.Get("uploadId") != "":
 		s.completeMultipart(w, bucket, key, q.Get("uploadId"))
 	case r.Method == http.MethodDelete && q.Get("uploadId") != "":
-		w.WriteHeader(http.StatusNoContent)
+		s.abortMultipart(w)
 	default:
 		http.Error(w, "unsupported", http.StatusBadRequest)
 	}
@@ -301,7 +329,24 @@ func (s *Server) headObject(w http.ResponseWriter, bucket, key string) {
 	w.WriteHeader(http.StatusOK)
 }
 
+func (s *Server) abortMultipart(w http.ResponseWriter) {
+	s.mu.Lock()
+	fail := s.failAborts > 0
+	if fail {
+		s.failAborts--
+	}
+	s.mu.Unlock()
+	if fail {
+		writeNotFound(w, "NoSuchUpload", "The specified upload does not exist.")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if s.waitUntilGetCanceled(r) {
+		return
+	}
 	s.mu.Lock()
 	bkt, ok := s.buckets[bucket]
 	var obj *object
@@ -331,6 +376,26 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	w.Header().Set("ETag", `"`+md5hex(value)+`"`)
 	writeMetadataHeaders(w, obj.meta)
 	_, _ = w.Write(chunk)
+}
+
+// waitUntilGetCanceled reports whether this GET was held until the client
+// went away. The handler writes nothing so the SDK surfaces the cancel.
+func (s *Server) waitUntilGetCanceled(r *http.Request) bool {
+	s.mu.Lock()
+	block := s.blockGetsUntilCancel
+	started := s.getStarted
+	if started != nil {
+		s.getStarted = nil
+	}
+	s.mu.Unlock()
+	if !block {
+		return false
+	}
+	if started != nil {
+		close(started)
+	}
+	<-r.Context().Done()
+	return true
 }
 
 func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key string) {

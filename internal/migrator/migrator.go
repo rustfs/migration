@@ -209,14 +209,19 @@ func (m *Migrator) handle(ctx context.Context, obj store.Object) error {
 			return fmt.Errorf("mark conflict key=%s: %w", obj.Key, err)
 		}
 		return nil
-	case s3client.IsNotFound(err):
-		// expected — proceed to copy
+	case ctx.Err() == nil && s3client.IsNotFound(err):
+		// Target is absent. A canceled HEAD must not take this branch: that
+		// would copy over an object the HEAD never confirmed was missing.
 	default:
 		return m.markFailed(obj.Key, fmt.Errorf("head new: %w", err))
 	}
 
 	if err := m.copy(ctx, obj); err != nil {
-		if s3client.IsNotFound(err) {
+		// skipped only when the source request finished with a real 404.
+		// Cancellation, deadlines, and interrupted reads stay failed so the
+		// next migrate retries them. A multipart abort's own 404
+		// (NoSuchUpload) is not a missing source object.
+		if ctx.Err() == nil && !s3client.IsCanceled(err) && s3client.IsNotFound(err) {
 			log.Printf("WARN source missing, skipping key=%s", obj.Key)
 			m.skipped.Add(1)
 			if err := m.Store.MarkStatus(obj.Key, store.StatusSkipped, "source 404"); err != nil {

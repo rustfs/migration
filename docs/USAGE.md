@@ -15,6 +15,7 @@ cp config.example.yaml config.yaml
 - `diff` HEADs the target for every source key; exit 1 if anything is missing or mismatched.
 - Never overwrites. Never deletes. Re-run after Ctrl-C.
 - A target object that already matches the inventory (same size; same ETag when both are present and neither is a multipart ETag `hash-N`) is marked `done`, not `conflict`. A different size or comparable ETag is still a conflict and is never overwritten. A Ctrl-C after a successful PUT therefore resumes as `done` instead of a false conflict.
+- `skipped` is only a source 404 / NoSuchKey from a request that finished. `context.Canceled`, `context.DeadlineExceeded`, and `request canceled` are `failed` (the next `migrate` retries them), even when the error text also contains `NotFound` or `StatusCode: 404`.
 - `multipart_part_size` must be at least 5 MiB (5242880). S3 rejects a smaller non-final part with `EntityTooSmall`. The 16 MiB default is unchanged. A smaller configured value fails at config load and is not clamped upward.
 
 ## Limiting load
