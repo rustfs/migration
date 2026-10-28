@@ -28,7 +28,11 @@ conflict_log: "./conflict.log"
 # 小对象落盘目录。默认是 db_path 所在目录。若 /tmp 是内存盘请改到真实磁盘。
 spool_dir: ""
 
-workers: 16                     # concurrent objects / 并发对象数
-multipart_threshold: 52428800   # 50 MiB
-multipart_part_size: 16777216   # 16 MiB
-multipart_concurrency: 4        # parts in parallel per large object / 大对象分片并发
+# No bandwidth / rate_limit / MB/s field. Peak ≈ workers × multipart_concurrency.
+# 没有 bandwidth、rate_limit 或 MB/s 字段。峰值大约是 workers × multipart_concurrency。
+# Lower workers first (then multipart_concurrency). Watch `migration status` and the NIC.
+# Stay under HAProxy maxconn. 先调小并发，再看 status 和网卡，留出 HAProxy maxconn 余量。
+workers: 16                     # objects copied at once / 同时拷贝的对象数（默认 16）
+multipart_threshold: 52428800   # 50 MiB；size ≥ this uses multipart / 达到则分片
+multipart_part_size: 16777216   # 16 MiB per part / 每片大小
+multipart_concurrency: 4        # parallel parts per large object / 单个大对象的并行分片数（默认 4）
