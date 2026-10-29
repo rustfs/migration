@@ -136,7 +136,10 @@ multipart_threshold: 1048576
 
 func TestCLIMigrateMultipartAndCleanDiff(t *testing.T) {
 	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
-	payload := bytes.Repeat([]byte("z"), 32)
+	// Part size must stay at the 5 MiB floor. Two parts (5 MiB + a short tail)
+	// still overlap under --multipart-concurrency 2.
+	const partSize = 5 * 1024 * 1024
+	payload := bytes.Repeat([]byte("z"), partSize+32)
 	oldS3 := fakes3.NewWithObjects(t, "photos", map[string][]byte{
 		"large.bin": payload,
 		"small.txt": []byte("ok"),
@@ -152,8 +155,8 @@ func TestCLIMigrateMultipartAndCleanDiff(t *testing.T) {
 bucket: photos
 workers: 1
 multipart_concurrency: 1
-multipart_threshold: 8
-multipart_part_size: 4
+multipart_threshold: 5242880
+multipart_part_size: 5242880
 `)
 
 	if out, err := execRoot(t, "scan", "-c", cfgPath); err != nil {

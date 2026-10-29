@@ -35,7 +35,7 @@ bucket: photos
 workers: 1
 multipart_concurrency: 1
 multipart_threshold: 1048576
-multipart_part_size: 1048576
+multipart_part_size: 16777216
 rate_limit: 0
 `)
 
