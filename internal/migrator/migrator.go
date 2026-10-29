@@ -18,6 +18,7 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/rustfs/migration/internal/config"
+	"github.com/rustfs/migration/internal/ratelimit"
 	"github.com/rustfs/migration/internal/s3client"
 	"github.com/rustfs/migration/internal/store"
 )
@@ -38,6 +39,11 @@ type Migrator struct {
 	skipped   atomic.Int64
 	failed    atomic.Int64
 	bytes     atomic.Int64
+
+	// lim is shared by every worker and every multipart part of this migrator.
+	// Nil means unlimited. Buckets are copied one at a time, so this is the
+	// process-wide source-read cap while a copy is running.
+	lim *ratelimit.Limiter
 }
 
 type objectAttrs struct {
@@ -72,16 +78,20 @@ func NewForBucket(cfg *config.Config, bucket string, oldCli, newCli *s3.Client, 
 		NewCli:   newCli,
 		Store:    st,
 		conflict: cw,
+		lim:      ratelimit.New(int64(cfg.RateLimit)),
 	}, nil
 }
 
 func (m *Migrator) Close() error { return m.conflict.Close() }
 
 func (m *Migrator) Run(ctx context.Context) error {
+	if err := m.Cfg.ValidateConcurrency(); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	jobs := make(chan store.Object, m.Cfg.Workers*2)
+	jobs := make(chan store.Object, config.JobBuffer(m.Cfg.Workers))
 	var fatalMu sync.Mutex
 	var firstFatal error
 	recordFatal := func(err error) {
@@ -283,7 +293,7 @@ func (m *Migrator) copySingle(ctx context.Context, obj store.Object) error {
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
 
-	written, err := io.Copy(tmp, out.Body)
+	written, err := io.Copy(tmp, m.throttle(ctx, out.Body))
 	if err != nil {
 		return fmt.Errorf("spool old body: %w", err)
 	}
@@ -335,6 +345,11 @@ func (m *Migrator) copyMultipart(ctx context.Context, obj store.Object) error {
 		return err
 	}
 
+	partConc := m.Cfg.MultipartConcurrency
+	if partConc < 1 {
+		return fmt.Errorf("multipart_concurrency must be >= 1, got %d", partConc)
+	}
+
 	partSize := m.Cfg.MultipartPartSize
 	numParts := int((obj.Size + partSize - 1) / partSize)
 	if numParts > 10000 {
@@ -374,7 +389,7 @@ func (m *Migrator) copyMultipart(ctx context.Context, obj store.Object) error {
 	}
 
 	parts := make([]s3types.CompletedPart, numParts)
-	sem := make(chan struct{}, m.Cfg.MultipartConcurrency)
+	sem := make(chan struct{}, partConc)
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
@@ -391,18 +406,26 @@ func (m *Migrator) copyMultipart(ctx context.Context, obj store.Object) error {
 		return firstErr
 	}
 
+partLoop:
 	for i := 0; i < numParts; i++ {
-		if ctx.Err() != nil {
-			break
-		}
 		if getFirstErr() != nil {
 			break
 		}
+		select {
+		case <-ctx.Done():
+			// Do not block on a full semaphore after Ctrl-C, and do not
+			// start parts that have not been scheduled yet.
+			break partLoop
+		case sem <- struct{}{}:
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			if err := ctx.Err(); err != nil {
+				setFirstErr(err)
+				return
+			}
 
 			start := int64(idx) * partSize
 			end := start + partSize - 1
@@ -420,7 +443,7 @@ func (m *Migrator) copyMultipart(ctx context.Context, obj store.Object) error {
 				setFirstErr(fmt.Errorf("get part %d: %w", idx+1, gerr))
 				return
 			}
-			body, rerr := io.ReadAll(getOut.Body)
+			body, rerr := io.ReadAll(m.throttle(ctx, getOut.Body))
 			getOut.Body.Close()
 			if rerr != nil {
 				setFirstErr(fmt.Errorf("read part %d: %w", idx+1, rerr))
@@ -475,6 +498,12 @@ func (m *Migrator) copyMultipart(ctx context.Context, obj store.Object) error {
 		return fmt.Errorf("size mismatch after multipart: got=%d want=%d", deref(head.ContentLength), obj.Size)
 	}
 	return nil
+}
+
+// throttle charges source body bytes to the shared limiter. Metadata HEAD
+// requests are not charged. A nil limiter returns the reader unchanged.
+func (m *Migrator) throttle(ctx context.Context, r io.Reader) io.Reader {
+	return ratelimit.Wrap(ctx, r, m.lim)
 }
 
 func deref(p *int64) int64 {

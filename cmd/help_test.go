@@ -27,6 +27,14 @@ func TestRootHelpBilingual(t *testing.T) {
 		"diff",
 		"list",
 		"status",
+		"--workers",
+		"--multipart-concurrency",
+		"--rate-limit",
+		"RATE_LIMIT",
+		"20M",
+		"20MiB",
+		"WORKERS",
+		"扫描始终单线程",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("help missing %q\n%s", want, out)

@@ -4,9 +4,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+)
+
+const (
+	// DefaultWorkers is the object-level pool size used by run/migrate/diff
+	// when YAML omits workers (or sets 0).
+	DefaultWorkers = 16
+	// DefaultMultipartConcurrency is the per-object part parallelism when
+	// multipart_concurrency is omitted or 0.
+	DefaultMultipartConcurrency = 4
 )
 
 type Endpoint struct {
@@ -30,6 +40,12 @@ type Config struct {
 	MultipartThreshold   int64 `yaml:"multipart_threshold"`
 	MultipartPartSize    int64 `yaml:"multipart_part_size"`
 	MultipartConcurrency int   `yaml:"multipart_concurrency"`
+
+	// RateLimit is the aggregate source-read cap in bytes per second, shared
+	// by every copy worker (including multipart parts). 0 means unlimited.
+	// YAML 0 and a missing field both stay unlimited; this is not rewritten
+	// to a default the way workers is.
+	RateLimit ByteRate `yaml:"rate_limit"`
 }
 
 // MinMultipartPartSize is the S3 minimum for every part except the last
@@ -54,19 +70,27 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	c.applyEnv()
+	if err := c.applyEnv(); err != nil {
+		return nil, err
+	}
 	c.applyDefaults()
 	c.normalize()
 	if err := c.ValidateNames(); err != nil {
 		return nil, err
 	}
+	if err := c.ValidateConcurrency(); err != nil {
+		return nil, err
+	}
 	if err := c.validateMultipartPartSize(); err != nil {
+		return nil, err
+	}
+	if err := c.ValidateRateLimit(); err != nil {
 		return nil, err
 	}
 	return c, nil
 }
 
-func (c *Config) applyEnv() {
+func (c *Config) applyEnv() error {
 	c.Old.Endpoint = envOr(c.Old.Endpoint, "OLD_ENDPOINT")
 	c.Old.AccessKey = envOr(c.Old.AccessKey, "OLD_AK")
 	c.Old.SecretKey = envOr(c.Old.SecretKey, "OLD_SK")
@@ -88,6 +112,51 @@ func (c *Config) applyEnv() {
 	c.DBPath = envOr(c.DBPath, "DB_PATH")
 	c.ConflictLog = envOr(c.ConflictLog, "CONFLICT_LOG")
 	c.SpoolDir = envOr(c.SpoolDir, "SPOOL_DIR")
+	if err := applyPositiveIntEnv(&c.Workers, "WORKERS"); err != nil {
+		return err
+	}
+	if err := applyPositiveIntEnv(&c.MultipartConcurrency, "MULTIPART_CONCURRENCY"); err != nil {
+		return err
+	}
+	if err := applyByteRateEnv(&c.RateLimit, "RATE_LIMIT"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// applyPositiveIntEnv overrides dst when key is set. Empty means "leave YAML".
+// Zero and negative values are rejected so an explicit env typo cannot fall
+// through to the default.
+func applyPositiveIntEnv(dst *int, key string) error {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fmt.Errorf("env %s=%q is not an integer", key, raw)
+	}
+	if n < 1 {
+		return fmt.Errorf("env %s must be >= 1, got %d", key, n)
+	}
+	*dst = n
+	return nil
+}
+
+// applyByteRateEnv overrides dst when key is set. Empty means "leave YAML".
+// 0 is a real value (unlimited) and replaces a YAML cap. Negative values and
+// unknown suffixes are rejected.
+func applyByteRateEnv(dst *ByteRate, key string) error {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	n, err := ParseByteRate(raw)
+	if err != nil {
+		return fmt.Errorf("env %s: %w", key, err)
+	}
+	*dst = ByteRate(n)
+	return nil
 }
 
 func envOr(current, key string) string {
@@ -104,18 +173,21 @@ func (c *Config) applyDefaults() {
 	if c.ConflictLog == "" {
 		c.ConflictLog = "./conflict.log"
 	}
-	if c.Workers <= 0 {
-		c.Workers = 16
+	// 0 (omitted) means "use the default". Negatives are left in place so
+	// ValidateConcurrency can reject them instead of silently rewriting a typo.
+	if c.Workers == 0 {
+		c.Workers = DefaultWorkers
 	}
-	if c.MultipartThreshold <= 0 {
+	if c.MultipartThreshold == 0 {
 		c.MultipartThreshold = 50 * 1024 * 1024
 	}
-	if c.MultipartPartSize <= 0 {
+	if c.MultipartPartSize == 0 {
 		c.MultipartPartSize = 16 * 1024 * 1024
 	}
-	if c.MultipartConcurrency <= 0 {
-		c.MultipartConcurrency = 4
+	if c.MultipartConcurrency == 0 {
+		c.MultipartConcurrency = DefaultMultipartConcurrency
 	}
+	// RateLimit 0 (omitted) stays 0: unlimited. Do not invent a default cap.
 	if c.SpoolDir == "" {
 		c.SpoolDir = filepath.Dir(c.DBPath)
 	}
@@ -181,6 +253,97 @@ func (c *Config) ValidatePair() error {
 		return fmt.Errorf("new.access_key and new.secret_key are required")
 	}
 	return nil
+}
+
+// ValidateConcurrency checks the knobs that size the worker pool and the
+// per-object part semaphore. Call it after defaults and again after CLI overrides.
+func (c *Config) ValidateConcurrency() error {
+	if c.Workers < 1 {
+		return fmt.Errorf("workers must be >= 1, got %d", c.Workers)
+	}
+	if c.MultipartConcurrency < 1 {
+		return fmt.Errorf("multipart_concurrency must be >= 1, got %d", c.MultipartConcurrency)
+	}
+	if c.MultipartThreshold < 1 {
+		return fmt.Errorf("multipart_threshold must be >= 1, got %d", c.MultipartThreshold)
+	}
+	if c.MultipartPartSize < 1 {
+		return fmt.Errorf("multipart_part_size must be >= 1, got %d", c.MultipartPartSize)
+	}
+	return nil
+}
+
+// ApplyConcurrencyOverrides replaces workers and/or multipart concurrency when
+// the matching CLI flag was explicitly set. Priority is CLI > env > YAML > default.
+func (c *Config) ApplyConcurrencyOverrides(workers, multipart int, workersSet, multipartSet bool) error {
+	if workersSet {
+		if workers < 1 {
+			return fmt.Errorf("workers must be >= 1, got %d", workers)
+		}
+		c.Workers = workers
+	}
+	if multipartSet {
+		if multipart < 1 {
+			return fmt.Errorf("multipart_concurrency must be >= 1, got %d", multipart)
+		}
+		c.MultipartConcurrency = multipart
+	}
+	return c.ValidateConcurrency()
+}
+
+// ValidateRateLimit rejects a negative cap. Zero is unlimited.
+func (c *Config) ValidateRateLimit() error {
+	if c.RateLimit < 0 {
+		return fmt.Errorf("rate_limit must be >= 0, got %d", int64(c.RateLimit))
+	}
+	return nil
+}
+
+// ApplyRateLimitOverride replaces the aggregate byte cap when --rate-limit
+// was explicitly set. Priority is CLI > env > YAML > default (unlimited).
+// 0 means unlimited, including on the CLI.
+func (c *Config) ApplyRateLimitOverride(raw string, set bool) error {
+	if set {
+		n, err := ParseByteRate(raw)
+		if err != nil {
+			return fmt.Errorf("rate_limit: %w", err)
+		}
+		c.RateLimit = ByteRate(n)
+	}
+	return c.ValidateRateLimit()
+}
+
+// MaxInFlight estimates per-host request fan-out: each worker may have
+// MultipartConcurrency parts in flight. It sizes HTTP idle pools and is not a hard cap.
+func (c *Config) MaxInFlight() int {
+	w := c.Workers
+	if w < 1 {
+		w = 1
+	}
+	p := c.MultipartConcurrency
+	if p < 1 {
+		p = 1
+	}
+	if w > 100000 || p > 10000 {
+		return 1024
+	}
+	n := w * p
+	if n < 1 || n > 1024 {
+		return 1024
+	}
+	return n
+}
+
+// JobBuffer bounds the in-memory queue in front of a worker pool.
+func JobBuffer(workers int) int {
+	if workers < 1 {
+		workers = 1
+	}
+	n := workers * 2
+	if n > 2048 {
+		return 2048
+	}
+	return n
 }
 
 // ApplyBucketFlag overrides YAML/env when --bucket is passed.

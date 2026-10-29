@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path"
 	"strings"
@@ -557,6 +558,255 @@ func TestCreateMissingTargetBucket(t *testing.T) {
 	got, ok := newS3.Object("photos", "a.txt")
 	if !ok || !bytes.Equal(got, []byte("hi")) {
 		t.Fatalf("target missing copied object ok=%v got=%q", ok, got)
+	}
+}
+
+func TestWorkersBoundParallelGets(t *testing.T) {
+	ctx := context.Background()
+	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
+	objs := map[string][]byte{}
+	for i := 0; i < 8; i++ {
+		objs[fmt.Sprintf("f%d.txt", i)] = []byte("hello")
+	}
+	oldS3 := fakes3.NewWithObjects(t, "bucket", objs, lm)
+	defer oldS3.Close()
+	oldS3.SetGetDelay(80 * time.Millisecond)
+	newS3 := fakes3.New(t)
+	defer newS3.Close()
+
+	oldClient := newTestClient(t, ctx, oldS3.URL)
+	newClient := newTestClient(t, ctx, newS3.URL)
+	if err := cluster.EnsureBucket(ctx, newClient, "bucket"); err != nil {
+		t.Fatal(err)
+	}
+	tmp := t.TempDir()
+	st, err := store.Open(path.Join(tmp, "m.db"), "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := scanner.Run(ctx, oldClient, "bucket", st); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testCfg(path.Join(tmp, "m.db"), path.Join(tmp, "c.log"), tmp)
+	cfg.Workers = 4
+	cfg.MultipartThreshold = 1 << 20
+	m, err := New(cfg, oldClient, newClient, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := oldS3.MaxGetInFlight()
+	if got < 2 || got > 4 {
+		t.Fatalf("workers=4 should overlap GETs, max in flight=%d", got)
+	}
+	counts, err := st.Counts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Done != 8 {
+		t.Fatalf("counts: %+v", counts)
+	}
+}
+
+func TestWorkersOneStaysSerial(t *testing.T) {
+	ctx := context.Background()
+	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
+	oldS3 := fakes3.NewWithObjects(t, "bucket", map[string][]byte{
+		"a.txt": []byte("a"),
+		"b.txt": []byte("b"),
+		"c.txt": []byte("c"),
+	}, lm)
+	defer oldS3.Close()
+	oldS3.SetGetDelay(30 * time.Millisecond)
+	newS3 := fakes3.New(t)
+	defer newS3.Close()
+	oldClient := newTestClient(t, ctx, oldS3.URL)
+	newClient := newTestClient(t, ctx, newS3.URL)
+	if err := cluster.EnsureBucket(ctx, newClient, "bucket"); err != nil {
+		t.Fatal(err)
+	}
+	tmp := t.TempDir()
+	st, err := store.Open(path.Join(tmp, "m.db"), "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := scanner.Run(ctx, oldClient, "bucket", st); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testCfg(path.Join(tmp, "m.db"), path.Join(tmp, "c.log"), tmp)
+	cfg.Workers = 1
+	cfg.MultipartThreshold = 1 << 20
+	m, err := New(cfg, oldClient, newClient, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := oldS3.MaxGetInFlight(); got != 1 {
+		t.Fatalf("workers=1 max in-flight GETs=%d", got)
+	}
+}
+
+func TestMultipartConcurrencyBoundsParts(t *testing.T) {
+	ctx := context.Background()
+	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
+	oldS3 := fakes3.NewWithObjects(t, "bucket", map[string][]byte{
+		"large.bin": bytes.Repeat([]byte("x"), 32),
+	}, lm)
+	defer oldS3.Close()
+	newS3 := fakes3.New(t)
+	defer newS3.Close()
+	newS3.SetPartDelay(50 * time.Millisecond)
+	oldClient := newTestClient(t, ctx, oldS3.URL)
+	newClient := newTestClient(t, ctx, newS3.URL)
+	if err := cluster.EnsureBucket(ctx, newClient, "bucket"); err != nil {
+		t.Fatal(err)
+	}
+	tmp := t.TempDir()
+	st, err := store.Open(path.Join(tmp, "m.db"), "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := scanner.Run(ctx, oldClient, "bucket", st); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testCfg(path.Join(tmp, "m.db"), path.Join(tmp, "c.log"), tmp)
+	cfg.Workers = 1
+	cfg.MultipartThreshold = 8
+	cfg.MultipartPartSize = 4
+	cfg.MultipartConcurrency = 2
+	m, err := New(cfg, oldClient, newClient, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := newS3.MaxPartInFlight()
+	if got < 2 || got > 2 {
+		t.Fatalf("multipart_concurrency=2 max in-flight parts=%d", got)
+	}
+	assertObject(t, newS3, "large.bin", bytes.Repeat([]byte("x"), 32))
+}
+
+func TestRunRejectsNonPositiveWorkers(t *testing.T) {
+	ctx := context.Background()
+	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
+	oldS3 := fakes3.NewWithObjects(t, "bucket", map[string][]byte{"a.txt": []byte("a")}, lm)
+	defer oldS3.Close()
+	newS3 := fakes3.New(t)
+	defer newS3.Close()
+	tmp := t.TempDir()
+	st, err := store.Open(path.Join(tmp, "m.db"), "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := testCfg(path.Join(tmp, "m.db"), path.Join(tmp, "c.log"), tmp)
+	cfg.Workers = 0
+	m, err := New(cfg, newTestClient(t, ctx, oldS3.URL), newTestClient(t, ctx, newS3.URL), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	start := time.Now()
+	err = m.Run(ctx)
+	if err == nil || time.Since(start) > time.Second {
+		t.Fatalf("err=%v elapsed=%s", err, time.Since(start))
+	}
+}
+
+func TestRunStopsWhenCancelled(t *testing.T) {
+	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
+	objs := map[string][]byte{}
+	for i := 0; i < 4; i++ {
+		objs[fmt.Sprintf("f%d.txt", i)] = []byte("hello-hello")
+	}
+	oldS3 := fakes3.NewWithObjects(t, "bucket", objs, lm)
+	defer oldS3.Close()
+	oldS3.SetGetDelay(3 * time.Second)
+	newS3 := fakes3.New(t)
+	defer newS3.Close()
+
+	ctx := context.Background()
+	oldClient := newTestClient(t, ctx, oldS3.URL)
+	newClient := newTestClient(t, ctx, newS3.URL)
+	if err := cluster.EnsureBucket(ctx, newClient, "bucket"); err != nil {
+		t.Fatal(err)
+	}
+	tmp := t.TempDir()
+	st, err := store.Open(path.Join(tmp, "m.db"), "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := scanner.Run(ctx, oldClient, "bucket", st); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testCfg(path.Join(tmp, "m.db"), path.Join(tmp, "c.log"), tmp)
+	cfg.Workers = 4
+	cfg.MultipartThreshold = 1 << 20
+	m, err := New(cfg, oldClient, newClient, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_ = m.Run(runCtx)
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("cancel did not stop the worker pool promptly: %s", elapsed)
+	}
+	counts, err := st.Counts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Done != 0 {
+		t.Fatalf("cancel must not mark objects done: %+v", counts)
+	}
+	if oldS3.DeleteObjectCalls() != 0 || newS3.DeleteObjectCalls() != 0 || oldS3.CopyObjectCalls() != 0 || newS3.CopyObjectCalls() != 0 {
+		t.Fatalf("cancel issued unsafe calls: oldDelete=%d newDelete=%d oldCopy=%d newCopy=%d",
+			oldS3.DeleteObjectCalls(), newS3.DeleteObjectCalls(), oldS3.CopyObjectCalls(), newS3.CopyObjectCalls())
+	}
+}
+
+func TestRunRejectsNonPositiveMultipart(t *testing.T) {
+	ctx := context.Background()
+	lm := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
+	oldS3 := fakes3.NewWithObjects(t, "bucket", map[string][]byte{"a.txt": []byte("a")}, lm)
+	defer oldS3.Close()
+	newS3 := fakes3.New(t)
+	defer newS3.Close()
+	tmp := t.TempDir()
+	st, err := store.Open(path.Join(tmp, "m.db"), "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := testCfg(path.Join(tmp, "m.db"), path.Join(tmp, "c.log"), tmp)
+	cfg.MultipartConcurrency = 0
+	m, err := New(cfg, newTestClient(t, ctx, oldS3.URL), newTestClient(t, ctx, newS3.URL), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Run(ctx); err == nil || !strings.Contains(err.Error(), "multipart_concurrency") {
+		t.Fatalf("got %v", err)
 	}
 }
 

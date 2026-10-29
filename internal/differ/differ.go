@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/rustfs/migration/internal/cluster"
+	"github.com/rustfs/migration/internal/config"
 	"github.com/rustfs/migration/internal/s3client"
 	_ "modernc.org/sqlite"
 )
@@ -79,7 +80,7 @@ func Run(ctx context.Context, oldCli, newCli *s3.Client, bucket string, opt Opti
 	}
 
 	res := Result{Bucket: bucket}
-	jobs := make(chan listed, opt.Workers*2)
+	jobs := make(chan listed, config.JobBuffer(opt.Workers))
 	var mu sync.Mutex
 	var fatal atomic.Value
 

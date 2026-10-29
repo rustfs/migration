@@ -47,6 +47,16 @@ type Server struct {
 	failAborts           int
 	blockGetsUntilCancel bool
 	getStarted           chan struct{}
+
+	getDelay     time.Duration
+	getInFlight  int
+	getMax       int
+	partDelay    time.Duration
+	partInFlight int
+	partMax      int
+	headDelay    time.Duration
+	headInFlight int
+	headMax      int
 }
 
 func New(t *testing.T) *Server {
@@ -88,6 +98,66 @@ func (s *Server) Put(bucket, key string, body []byte, lm time.Time, meta Metadat
 		body: append([]byte(nil), body...),
 		lm:   lm,
 		meta: meta,
+	}
+}
+
+// SetGetDelay sleeps inside each GetObject so tests can observe overlap.
+func (s *Server) SetGetDelay(d time.Duration) {
+	s.mu.Lock()
+	s.getDelay = d
+	s.mu.Unlock()
+}
+
+// SetPartDelay sleeps inside each UploadPart.
+func (s *Server) SetPartDelay(d time.Duration) {
+	s.mu.Lock()
+	s.partDelay = d
+	s.mu.Unlock()
+}
+
+// SetHeadDelay sleeps inside each HeadObject so tests can observe overlap.
+func (s *Server) SetHeadDelay(d time.Duration) {
+	s.mu.Lock()
+	s.headDelay = d
+	s.mu.Unlock()
+}
+
+// MaxGetInFlight is the highest number of GetObject calls that overlapped.
+func (s *Server) MaxGetInFlight() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getMax
+}
+
+// MaxPartInFlight is the highest number of UploadPart calls that overlapped.
+func (s *Server) MaxPartInFlight() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.partMax
+}
+
+// MaxHeadInFlight is the highest number of HeadObject calls that overlapped.
+func (s *Server) MaxHeadInFlight() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.headMax
+}
+
+func (s *Server) enterFlight(delay *time.Duration, cur, max *int) func() {
+	s.mu.Lock()
+	*cur++
+	if *cur > *max {
+		*max = *cur
+	}
+	d := *delay
+	s.mu.Unlock()
+	if d > 0 {
+		time.Sleep(d)
+	}
+	return func() {
+		s.mu.Lock()
+		*cur--
+		s.mu.Unlock()
 	}
 }
 
@@ -311,6 +381,9 @@ func (s *Server) listObjects(w http.ResponseWriter, bucket string) {
 }
 
 func (s *Server) headObject(w http.ResponseWriter, bucket, key string) {
+	release := s.enterFlight(&s.headDelay, &s.headInFlight, &s.headMax)
+	defer release()
+
 	s.mu.Lock()
 	bkt, ok := s.buckets[bucket]
 	var obj *object
@@ -347,6 +420,9 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	if s.waitUntilGetCanceled(r) {
 		return
 	}
+	release := s.enterFlight(&s.getDelay, &s.getInFlight, &s.getMax)
+	defer release()
+
 	s.mu.Lock()
 	bkt, ok := s.buckets[bucket]
 	var obj *object
@@ -427,6 +503,9 @@ func (s *Server) createMultipart(w http.ResponseWriter, r *http.Request, bucket,
 }
 
 func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, key string, q url.Values) {
+	release := s.enterFlight(&s.partDelay, &s.partInFlight, &s.partMax)
+	defer release()
+
 	body, _ := io.ReadAll(r.Body)
 	partNumber, _ := strconv.Atoi(q.Get("partNumber"))
 	uploadID := q.Get("uploadId")

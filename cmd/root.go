@@ -24,9 +24,12 @@ import (
 )
 
 var (
-	cfgPath    string
-	bucketFlag string
-	diffExtra  bool
+	cfgPath           string
+	bucketFlag        string
+	diffExtra         bool
+	workersFlag       int
+	multipartConcFlag int
+	rateLimitFlag     string
 )
 
 func Execute() error {
@@ -44,6 +47,9 @@ func NewRoot() *cobra.Command {
 	}
 	root.PersistentFlags().StringVarP(&cfgPath, "config", "c", "config.yaml", "config YAML path / 配置文件路径")
 	root.PersistentFlags().StringVar(&bucketFlag, "bucket", "", "bucket name (empty = all) / 桶名（空=全部）")
+	root.PersistentFlags().IntVar(&workersFlag, "workers", 0, "concurrent objects for run/migrate/diff, overrides YAML (must be >= 1) / 对象并发数，覆盖配置，须 >= 1")
+	root.PersistentFlags().IntVar(&multipartConcFlag, "multipart-concurrency", 0, "parallel parts per large object, overrides YAML (must be >= 1) / 单个大对象的分片并发，覆盖配置，须 >= 1")
+	root.PersistentFlags().StringVar(&rateLimitFlag, "rate-limit", "", "aggregate source-read cap for run/migrate, e.g. 20M or 20MiB; 0 = unlimited / 所有 worker 从源读取的合计上限，例如 20M 或 20MiB；0 表示不限速")
 	root.CompletionOptions.DisableDefaultCmd = true
 
 	root.AddCommand(listCmd())
@@ -70,13 +76,24 @@ func signalCtx() (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
-func loadConfig() (*config.Config, error) {
+func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return nil, err
 	}
 	cfg.ApplyBucketFlag(bucketFlag)
 	if err := cfg.ValidateNames(); err != nil {
+		return nil, err
+	}
+	if err := cfg.ApplyConcurrencyOverrides(
+		workersFlag,
+		multipartConcFlag,
+		cmd.Flags().Changed("workers"),
+		cmd.Flags().Changed("multipart-concurrency"),
+	); err != nil {
+		return nil, err
+	}
+	if err := cfg.ApplyRateLimitOverride(rateLimitFlag, cmd.Flags().Changed("rate-limit")); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -88,7 +105,7 @@ func listCmd() *cobra.Command {
 		Short: listShort,
 		Long:  listLong,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig()
+			cfg, err := loadConfig(cmd)
 			if err != nil {
 				return err
 			}
@@ -97,7 +114,7 @@ func listCmd() *cobra.Command {
 			}
 			ctx, cancel := signalCtx()
 			defer cancel()
-			oldCli, err := s3client.New(ctx, cfg.Old)
+			oldCli, err := s3client.NewWithPool(ctx, cfg.Old, cfg.MaxInFlight())
 			if err != nil {
 				return err
 			}
@@ -129,7 +146,7 @@ func runCmd() *cobra.Command {
 		Short: runShort,
 		Long:  runLong,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return forEachBucket(true, func(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error {
+			return forEachBucket(cmd, true, func(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error {
 				if err := scanOne(ctx, cfg, oldCli, bucket); err != nil {
 					return err
 				}
@@ -145,7 +162,7 @@ func scanCmd() *cobra.Command {
 		Short: scanShort,
 		Long:  scanLong,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig()
+			cfg, err := loadConfig(cmd)
 			if err != nil {
 				return err
 			}
@@ -154,7 +171,7 @@ func scanCmd() *cobra.Command {
 			}
 			ctx, cancel := signalCtx()
 			defer cancel()
-			oldCli, err := s3client.New(ctx, cfg.Old)
+			oldCli, err := s3client.NewWithPool(ctx, cfg.Old, cfg.MaxInFlight())
 			if err != nil {
 				return err
 			}
@@ -181,7 +198,7 @@ func migrateCmd() *cobra.Command {
 		Short: migrateShort,
 		Long:  migrateLong,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return forEachBucket(true, func(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error {
+			return forEachBucket(cmd, true, func(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error {
 				return migrateOne(ctx, cfg, oldCli, newCli, bucket)
 			})
 		},
@@ -194,7 +211,7 @@ func diffCmd() *cobra.Command {
 		Short: diffShort,
 		Long:  diffLong,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return forEachBucket(true, func(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error {
+			return forEachBucket(cmd, true, func(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error {
 				res, err := differ.Run(ctx, oldCli, newCli, bucket, differ.Options{
 					Workers:     cfg.Workers,
 					ReportExtra: diffExtra,
@@ -221,7 +238,7 @@ func statusCmd() *cobra.Command {
 		Short: statusShort,
 		Long:  statusLong,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig()
+			cfg, err := loadConfig(cmd)
 			if err != nil {
 				return err
 			}
@@ -256,8 +273,8 @@ func statusCmd() *cobra.Command {
 	}
 }
 
-func forEachBucket(needTarget bool, fn func(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error) error {
-	cfg, err := loadConfig()
+func forEachBucket(cmd *cobra.Command, needTarget bool, fn func(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error) error {
+	cfg, err := loadConfig(cmd)
 	if err != nil {
 		return err
 	}
@@ -270,13 +287,14 @@ func forEachBucket(needTarget bool, fn func(ctx context.Context, cfg *config.Con
 	}
 	ctx, cancel := signalCtx()
 	defer cancel()
-	oldCli, err := s3client.New(ctx, cfg.Old)
+	pool := cfg.MaxInFlight()
+	oldCli, err := s3client.NewWithPool(ctx, cfg.Old, pool)
 	if err != nil {
 		return err
 	}
 	var newCli *s3.Client
 	if needTarget {
-		newCli, err = s3client.New(ctx, cfg.New)
+		newCli, err = s3client.NewWithPool(ctx, cfg.New, pool)
 		if err != nil {
 			return err
 		}
@@ -285,7 +303,7 @@ func forEachBucket(needTarget bool, fn func(ctx context.Context, cfg *config.Con
 	if err != nil {
 		return err
 	}
-	log.Printf("buckets=%d  %s → %s  workers=%d", len(names), cfg.Old.Endpoint, cfg.New.Endpoint, cfg.Workers)
+	log.Printf("buckets=%d  %s → %s  workers=%d  rate_limit=%s", len(names), cfg.Old.Endpoint, cfg.New.Endpoint, cfg.Workers, cfg.RateLimit)
 	var failed []string
 	for _, name := range names {
 		if err := ctx.Err(); err != nil {
@@ -329,7 +347,7 @@ func scanOne(ctx context.Context, cfg *config.Config, oldCli *s3.Client, bucket 
 		return err
 	}
 	defer st.Close()
-	log.Printf("scan: bucket=%s db=%s", bucket, cfg.DBPathFor(bucket))
+	log.Printf("scan: bucket=%s db=%s (single-threaded list; --workers applies to copy and diff)", bucket, cfg.DBPathFor(bucket))
 	_, err = scanner.Run(ctx, oldCli, bucket, st)
 	return err
 }
@@ -351,8 +369,8 @@ func migrateOne(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Clie
 		return err
 	}
 	defer m.Close()
-	log.Printf("migrate: bucket=%s workers=%d threshold=%dMiB partSize=%dMiB partConcurrency=%d",
-		bucket, cfg.Workers, cfg.MultipartThreshold>>20, cfg.MultipartPartSize>>20, cfg.MultipartConcurrency)
+	log.Printf("migrate: bucket=%s workers=%d rate_limit=%s threshold=%dMiB partSize=%dMiB partConcurrency=%d",
+		bucket, cfg.Workers, cfg.RateLimit, cfg.MultipartThreshold>>20, cfg.MultipartPartSize>>20, cfg.MultipartConcurrency)
 	return m.Run(ctx)
 }
 

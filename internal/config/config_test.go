@@ -215,3 +215,169 @@ func TestApplyBucketFlag(t *testing.T) {
 		t.Fatalf("got %q", c.Bucket)
 	}
 }
+
+func TestConcurrencyYAMLAndDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+old: {endpoint: "http://a:1", access_key: a, secret_key: b}
+new: {endpoint: "http://b:2", access_key: c, secret_key: d}
+workers: 8
+multipart_concurrency: 2
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workers != 8 || cfg.MultipartConcurrency != 2 {
+		t.Fatalf("yaml concurrency lost: workers=%d parts=%d", cfg.Workers, cfg.MultipartConcurrency)
+	}
+	if cfg.MaxInFlight() != 16 {
+		t.Fatalf("max in flight: %d", cfg.MaxInFlight())
+	}
+}
+
+func TestConcurrencyEnvOverridesYAML(t *testing.T) {
+	t.Setenv("WORKERS", "12")
+	t.Setenv("MULTIPART_CONCURRENCY", "6")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+old: {endpoint: "http://a:1", access_key: a, secret_key: b}
+workers: 3
+multipart_concurrency: 1
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workers != 12 || cfg.MultipartConcurrency != 6 {
+		t.Fatalf("env override failed: workers=%d parts=%d", cfg.Workers, cfg.MultipartConcurrency)
+	}
+	if err := cfg.ApplyConcurrencyOverrides(9, 3, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workers != 9 || cfg.MultipartConcurrency != 3 {
+		t.Fatalf("cli should win: workers=%d parts=%d", cfg.Workers, cfg.MultipartConcurrency)
+	}
+}
+
+func TestRejectsNonPositiveConcurrency(t *testing.T) {
+	cases := []string{
+		"workers: -1\n",
+		"multipart_concurrency: -2\n",
+		"multipart_threshold: -1\n",
+		"multipart_part_size: -5\n",
+	}
+	for _, extra := range cases {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		body := "old: {endpoint: \"http://a:1\", access_key: a, secret_key: b}\n" + extra
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("expected error for %q", extra)
+		}
+	}
+
+	t.Setenv("WORKERS", "0")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+old: {endpoint: "http://a:1", access_key: a, secret_key: b}
+workers: 4
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected WORKERS=0 to fail")
+	}
+}
+
+func TestRejectsBadConcurrencyEnv(t *testing.T) {
+	t.Setenv("MULTIPART_CONCURRENCY", "nope")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+old: {endpoint: "http://a:1", access_key: a, secret_key: b}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected non-integer env to fail")
+	}
+}
+
+func TestApplyConcurrencyOverridesRejectsZero(t *testing.T) {
+	c := &Config{Workers: 4, MultipartConcurrency: 2, MultipartThreshold: 1, MultipartPartSize: 1}
+	if err := c.ApplyConcurrencyOverrides(0, 2, true, false); err == nil {
+		t.Fatal("expected workers=0 to fail")
+	}
+	if c.Workers != 4 {
+		t.Fatalf("failed override mutated workers to %d", c.Workers)
+	}
+	if err := c.ApplyConcurrencyOverrides(4, 0, false, true); err == nil {
+		t.Fatal("expected multipart 0 to fail")
+	}
+}
+
+func TestConcurrencyPriorityAndZeroDefaults(t *testing.T) {
+	base := "old: {endpoint: \"http://a:1\", access_key: a, secret_key: b}\n"
+	cases := []struct {
+		name    string
+		yaml    string
+		envW    string
+		envP    string
+		wantW   int
+		wantP   int
+		wantErr string
+	}{
+		{name: "omit uses defaults", wantW: 16, wantP: 4},
+		{name: "yaml zero uses defaults", yaml: "workers: 0\nmultipart_concurrency: 0\n", wantW: 16, wantP: 4},
+		{name: "yaml value kept", yaml: "workers: 5\nmultipart_concurrency: 3\n", wantW: 5, wantP: 3},
+		{name: "env overrides yaml", yaml: "workers: 5\nmultipart_concurrency: 3\n", envW: "8", envP: "6", wantW: 8, wantP: 6},
+		{name: "env workers only", yaml: "workers: 5\nmultipart_concurrency: 3\n", envW: "9", wantW: 9, wantP: 3},
+		{name: "negative yaml workers", yaml: "workers: -1\n", wantErr: "workers must be >= 1"},
+		{name: "negative yaml multipart", yaml: "multipart_concurrency: -2\n", wantErr: "multipart_concurrency must be >= 1"},
+		{name: "env workers zero", yaml: "workers: 5\n", envW: "0", wantErr: "WORKERS must be >= 1"},
+		{name: "env multipart zero", envP: "0", wantErr: "MULTIPART_CONCURRENCY must be >= 1"},
+		{name: "env workers negative", envW: "-4", wantErr: "WORKERS must be >= 1"},
+		{name: "env workers not integer", envW: "many", wantErr: "not an integer"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envW != "" {
+				t.Setenv("WORKERS", tc.envW)
+			}
+			if tc.envP != "" {
+				t.Setenv("MULTIPART_CONCURRENCY", tc.envP)
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(base+tc.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error %v, want substring %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Workers != tc.wantW || cfg.MultipartConcurrency != tc.wantP {
+				t.Fatalf("workers=%d multipart=%d, want %d and %d", cfg.Workers, cfg.MultipartConcurrency, tc.wantW, tc.wantP)
+			}
+		})
+	}
+}
+
+func TestJobBufferCaps(t *testing.T) {
+	if JobBuffer(1) != 2 {
+		t.Fatalf("got %d", JobBuffer(1))
+	}
+	if JobBuffer(100000) != 2048 {
+		t.Fatalf("got %d", JobBuffer(100000))
+	}
+}
