@@ -5,9 +5,17 @@ The README has the same commands in both languages.
 
 ```bash
 cp config.example.yaml config.yaml
+CGO_ENABLED=0 go build -o bin/migration .
 ./bin/migration --help
 ./bin/migration run  -c config.yaml --workers 16 --rate-limit 20M
 ./bin/migration diff -c config.yaml
+```
+
+Cross-compile a static Linux binary (no cgo). `linux/arm64` is the usual target for an arm64 server:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o bin/migration-linux-arm64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/migration-linux-amd64 .
 ```
 
 - Empty `bucket:` migrates every source bucket. `--bucket NAME` pins one.

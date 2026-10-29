@@ -5,7 +5,7 @@ Safe one-way object migration between two S3-compatible clusters
 
 在两个 S3 兼容集群之间做安全的单向对象迁移。**永不覆盖、永不删除、可断点续传。**
 
-完整中文手册：[docs/使用手册.md](docs/使用手册.md) · Short English notes: [docs/USAGE.md](docs/USAGE.md)
+日常用法写在本文（中文为主）。完整手册：[docs/使用手册.md](docs/使用手册.md) · Short English notes: [docs/USAGE.md](docs/USAGE.md)
 
 ---
 
@@ -13,9 +13,16 @@ Safe one-way object migration between two S3-compatible clusters
 
 ```bash
 cp config.example.yaml config.yaml   # endpoints and keys
-go build -o bin/migration .
+CGO_ENABLED=0 go build -o bin/migration .
 ./bin/migration run  -c config.yaml --workers 16 --rate-limit 20M
 ./bin/migration diff -c config.yaml
+```
+
+Cross-compile a static Linux ELF (pure Go, no cgo, no shared libraries). Copy the binary to the server and run it there:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o bin/migration-linux-arm64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/migration-linux-amd64 .
 ```
 
 | Command | What it does |
@@ -57,19 +64,59 @@ One bandwidth cap, shared by every copy worker (including parts of a large objec
 
 ## 中文使用说明
 
+下面是可以照着做的日常用法。状态机、路径和排错的完整说明仍在 [docs/使用手册.md](docs/使用手册.md)。
+
+**永不覆盖目标上已有对象。永不删除任何一侧的数据。** 中断后再次 `migrate` 或 `run` 即可续跑；已经 `done` / `conflict` 的对象不会重传，也不会被覆盖。
+
+### 快速上手
+
+```bash
+CGO_ENABLED=0 go build -o bin/migration .   # 本机；Linux arm64 见 §1 交叉编译
+cp config.example.yaml config.yaml          # 填写 old / new
+./bin/migration run    -c config.yaml --workers 16 --rate-limit 20M
+./bin/migration status -c config.yaml
+./bin/migration diff   -c config.yaml --workers 32
+# 若中途 Ctrl-C：
+./bin/migration migrate -c config.yaml
+```
+
 ### 1. 安装编译
 
-需要 Go 1.22 或更高版本。SQLite 是纯 Go 实现，**不需要 CGO**。
+需要 Go 1.22 或更高版本（见 `go.mod`）。SQLite 是纯 Go 实现，**不需要 CGO**。
+
+本机：
 
 ```bash
 git clone https://github.com/rustfs/migration.git
 cd migration
+CGO_ENABLED=0 go test ./...          # 可选
 CGO_ENABLED=0 go build -o bin/migration .
 # 或
 make build
 ```
 
 得到静态二进制 `bin/migration`。
+
+#### 交叉编译 Linux
+
+在 macOS 或其它开发机上交叉编译。产物是静态链接的 ELF，拷到对应架构的 Linux 服务器后直接执行，不需要 CGO，也不需要动态库。`GOOS` / `GOARCH` 只影响这一次 `go build`。
+
+```bash
+# linux/arm64
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+  go build -o bin/migration-linux-arm64 .
+
+# linux/amd64
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -o bin/migration-linux-amd64 .
+```
+
+在 arm64 服务器上：
+
+```bash
+chmod +x migration-linux-arm64
+./migration-linux-arm64 run -c config.yaml --workers 16 --rate-limit 20M
+```
 
 ### 2. 配置
 
@@ -97,11 +144,13 @@ conflict_log: "./conflict.log"
 spool_dir: ""                     # 小对象临时目录，默认跟 db 同目录
 
 workers: 16                       # 对象并发，默认 16
-multipart_threshold: 52428800     # >= 50MiB 走分片
-multipart_part_size: 16777216     # 分片大小 16MiB
+multipart_threshold: 52428800     # >= 50MiB 走分片。生产常用 50MiB；压测可降到 5MiB
+multipart_part_size: 16777216     # 分片大小 16MiB。非末片必须 >= 5MiB（5242880）
 multipart_concurrency: 4          # 单个大对象的分片并发，默认 4
 rate_limit: 0                     # 源读取合计上限。0 = 不限速。20M = 20000000 字节/秒
 ```
+
+`multipart_part_size` 小于 5MiB 时，S3 会拒绝非末片（`EntityTooSmall`）。配置更小会在加载时直接失败，不会被悄悄抬高。生产把 `multipart_threshold` 留在 50MiB；只有压测需要更早走分片时，才把它降到 5MiB，并且 `multipart_part_size` 仍然不能小于 5MiB。
 
 `bucket:` 留空会迁移来源上的**每一个桶**。只迁一个桶时写成 `bucket: photos`，或命令行加 `--bucket photos`。
 
@@ -302,5 +351,14 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
 | diff 还有 missing | 再 `migration migrate`，并看 `failed` 行的 `last_error` |
 
 退出码：`0` 成功（只迁一个桶时，复制阶段第一次 Ctrl-C 也是 0，没做完的对象留在 SQLite）；`1` 配置错误、远端错误、某桶失败、diff 发现缺口，或在扫描 / 多桶切换时被中断；`130` 第二次信号强制退出。
+
+### 9. 一次回归记录（RustFS 1.0.4）
+
+下面是同一次构建的结果，不是性能承诺。migration `6224d05`，`CGO_ENABLED=0`，`go test ./...` 通过；同一构建交叉编译了 `linux/arm64` 与 `linux/amd64` 静态二进制。源和目标都是官方 RustFS 1.0.4。
+
+| 场景 | 结果 |
+| --- | --- |
+| 冒烟，1502 个对象 | SIGINT 中断后，取消记为 `failed`，不是 `skipped`。再 `migrate` 后 `done=1499`、`conflict=3`，`failed=0`，`skipped=0`。再跑一遍，复制数为 0 |
+| 压测，50001 个对象 | 中断时 `skipped=0`。续跑后 `done=49998`、`conflict=3`，`failed=0`，`skipped=0`。`diff` 的 `etag_mismatch=3` 只来自事先放好的冲突对象，没有缺失，也没有被覆盖 |
 
 更细的状态机、路径和排错见 [docs/使用手册.md](docs/使用手册.md)。设计约束见 [docs/DESIGN.md](docs/DESIGN.md)。
