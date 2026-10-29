@@ -283,6 +283,8 @@ The worker's return value distinguishes two error classes:
 
 - **Per-object errors** (transient 5xx, network blips, validation mismatch) →
   `markFailed` records the message and returns `nil`. The worker keeps going.
+  Those rows do not fail the process: `Run` still returns nil and the CLI
+  exits 0. `status` is what shows `failed`.
 - **Fatal errors** (SQLite write failed, `conflict.log` append failed) → the
   worker returns the error, which is fed into `recordFatal`. The first fatal
   error is captured **and** triggers `cancel()` on the worker context, so the
@@ -418,7 +420,7 @@ Recommended additional tests for production validation:
 - **End-to-end server-side checksums** (`x-amz-checksum-*`) once both clusters
   consistently support them, so multipart uploads can verify content rather
   than only size.
-- **Rate limiting** (objects/sec, bytes/sec) to protect HAProxy during peak
-  hours.
+- **Objects per second.** Byte-rate limiting already exists (`rate_limit` /
+  `--rate-limit`, one shared token bucket on source body reads).
 - **Versioned buckets / delete markers / Object Lock** (explicitly out of
   scope today).

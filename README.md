@@ -13,10 +13,13 @@ Safe one-way object migration between two S3-compatible clusters
 
 ```bash
 cp config.example.yaml config.yaml   # endpoints and keys
-go build -o bin/migration .
+make build                           # bin/migration (CGO_ENABLED=0, Go 1.22+)
+make build-linux                     # bin/migration-linux-amd64 and bin/migration-linux-arm64
 ./bin/migration run  -c config.yaml --workers 16 --rate-limit 20M
 ./bin/migration diff -c config.yaml
 ```
+
+Linux x86_64 / arm64 binaries are static (`CGO_ENABLED=0`, pure-Go SQLite) and are not committed. `20M` is 20×1000×1000 bytes/s. See [docs/使用手册.md](docs/使用手册.md) §2 and §9.3.
 
 | Command | What it does |
 | --- | --- |
@@ -48,6 +51,8 @@ One bandwidth cap, shared by every copy worker (including parts of a large objec
 
 `HeadObject` runs before every write. A matching object (same size and comparable ETag) is `done`; mismatches go to `conflict.log` and are never overwritten. There is no `DeleteObject`. A finished source 404 is `skipped`; cancel and deadline are `failed`. Ctrl-C cancels the pool; run `migrate` again to resume from SQLite.
 
+`run` exiting 0 does not mean every object succeeded. Per-object errors stay `failed` in SQLite. Check `status`, then `diff`. The startup line `rate_limit=20MB/s` confirms a `20M` cap; `unlimited` means the cap is off.
+
 ```text
 ./bin/migration --help
 ./bin/migration run --help
@@ -64,12 +69,13 @@ One bandwidth cap, shared by every copy worker (including parts of a large objec
 ```bash
 git clone https://github.com/rustfs/migration.git
 cd migration
-CGO_ENABLED=0 go build -o bin/migration .
-# 或
 make build
+# 等价于 CGO_ENABLED=0 go build -o bin/migration .
+make build-linux
+# bin/migration-linux-amd64 与 bin/migration-linux-arm64，均为静态 ELF
 ```
 
-得到静态二进制 `bin/migration`。
+得到静态二进制。仓库不提交 `bin/`。细节见手册 §2。
 
 ### 2. 配置
 

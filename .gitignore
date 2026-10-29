@@ -1,4 +1,5 @@
 /bin/
+/artifacts/
 /target/
 *.db
 *.db-wal
