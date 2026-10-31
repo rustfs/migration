@@ -1,5 +1,16 @@
 # migration
 
+<p align="center">
+English | <a href="https://github.com/rustfs/migration/blob/main/README_ZH.md">简体中文</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_DE.md">Deutsch</a> |
+  <a href="https://readme-i18n.com/rustfs/migration?lang=es">Español</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_FR.md">français</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_JA.md">日本語</a> |
+  <a href="https://readme-i18n.com/rustfs/migration?lang=ko">한국어</a> |
+  <a href="https://readme-i18n.com/rustfs/migration?lang=pt">Portuguese</a> |
+  <a href="https://readme-i18n.com/rustfs/migration?lang=ru">Русский</a>
+</p>
+
 `migration` copies objects one way between two S3-compatible clusters. It targets self-hosted RustFS and MinIO, and any other endpoint that speaks the S3 API. Requests always use path-style addressing, which is the usual setup for those clusters.
 
 Run it next to live traffic. Three rules hold for every command that writes:
@@ -14,16 +25,20 @@ The copy carries the current object, plus `Content-Type`, `Cache-Control`, `Cont
 
 In the config file the source cluster is `old` and the target cluster is `new`.
 
-中文操作手册：[docs/使用手册.md](docs/使用手册.md)。本文件是英文使用说明。
-
 ## Documentation
 
 | Guide | What it is |
 | --- | --- |
-| This README | English install, configuration, commands, tuning, and safety |
-| [docs/USAGE.md](docs/USAGE.md) | Short English companion for the same behavior |
-| [docs/使用手册.md](docs/使用手册.md) | Full Chinese handbook |
+| This file | English install, configuration, commands, tuning, and safety |
+| [README_ZH.md](README_ZH.md) | 简体中文，同一结构 |
+| [README_DE.md](README_DE.md) | Deutsch, same structure |
+| [README_FR.md](README_FR.md) | français, same structure |
+| [README_JA.md](README_JA.md) | 日本語，同一结构 |
+| [docs/USAGE.md](docs/USAGE.md) | Short English companion |
+| [docs/使用手册.md](docs/使用手册.md) | Longer Chinese handbook |
 | [docs/DESIGN.md](docs/DESIGN.md) | Architecture and the constraints the tool will not relax |
+
+Español, 한국어, Portuguese, and Русский are linked from the language bar through readme-i18n. They are not checked into this repository.
 
 `migration --help` and `migration <command> --help` print bilingual English and Chinese help.
 
