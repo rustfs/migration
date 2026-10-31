@@ -4,12 +4,12 @@
   <a href="https://github.com/rustfs/migration/blob/main/README.md">English</a> |
   <a href="https://github.com/rustfs/migration/blob/main/README_ZH.md">简体中文</a> |
   Deutsch |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=es">Español</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_ES.md">Español</a> |
   <a href="https://github.com/rustfs/migration/blob/main/README_FR.md">français</a> |
   <a href="https://github.com/rustfs/migration/blob/main/README_JA.md">日本語</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=ko">한국어</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=pt">Portuguese</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=ru">Русский</a>
+  <a href="https://github.com/rustfs/migration/blob/main/README_KO.md">한국어</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_PT.md">Portuguese</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_RU.md">Русский</a>
 </p>
 
 `migration` kopiert Objekte in eine Richtung zwischen zwei S3-kompatiblen Clustern. Gedacht ist es für selbst betriebenes RustFS und MinIO sowie für jeden anderen Endpunkt, der die S3-API spricht. Anfragen verwenden immer Path-Style-Adressierung, wie es bei diesen Clustern üblich ist.
@@ -35,11 +35,13 @@ In der Konfiguration ist die Quelle `old` und das Ziel `new`.
 | [README_ZH.md](README_ZH.md) | 简体中文 |
 | [README_FR.md](README_FR.md) | français |
 | [README_JA.md](README_JA.md) | 日本語 |
+| [README_ES.md](README_ES.md) | Español |
+| [README_KO.md](README_KO.md) | 한국어 |
+| [README_PT.md](README_PT.md) | Portuguese |
+| [README_RU.md](README_RU.md) | Русский |
 | [docs/USAGE.md](docs/USAGE.md) | Kurze englische Begleitseite |
 | [docs/使用手册.md](docs/使用手册.md) | Ausführlicheres chinesisches Handbuch |
 | [docs/DESIGN.md](docs/DESIGN.md) | Architektur und die Grenzen, die das Werkzeug nicht lockert |
-
-Español, 한국어, Portuguese und Русский öffnet die Sprachleiste über readme-i18n. Diese Fassungen liegen nicht im Repository.
 
 `migration --help` und `migration <Befehl> --help` drucken die Hilfe zweisprachig auf Englisch und Chinesisch.
 

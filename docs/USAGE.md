@@ -1,6 +1,6 @@
 # migration — English usage notes
 
-The English operator guide is the [README](../README.md): install, configuration, workflows, tuning, safety, and exit codes. The same guide is in the repository as [简体中文](../README_ZH.md), [Deutsch](../README_DE.md), [français](../README_FR.md), and [日本語](../README_JA.md). The language bar on each README also links Español, 한국어, Portuguese, and Русский through readme-i18n.
+The English operator guide is the [README](../README.md): install, configuration, workflows, tuning, safety, and exit codes. The same guide is in the repository as [简体中文](../README_ZH.md), [Deutsch](../README_DE.md), [Español](../README_ES.md), [français](../README_FR.md), [日本語](../README_JA.md), [한국어](../README_KO.md), [Portuguese](../README_PT.md), and [Русский](../README_RU.md).
 
 This page is the short English companion, so the rules that are easy to get wrong stay next to the commands.
 

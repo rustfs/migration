@@ -4,12 +4,12 @@
   <a href="https://github.com/rustfs/migration/blob/main/README.md">English</a> |
   <a href="https://github.com/rustfs/migration/blob/main/README_ZH.md">简体中文</a> |
   <a href="https://github.com/rustfs/migration/blob/main/README_DE.md">Deutsch</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=es">Español</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_ES.md">Español</a> |
   <a href="https://github.com/rustfs/migration/blob/main/README_FR.md">français</a> |
   日本語 |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=ko">한국어</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=pt">Portuguese</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=ru">Русский</a>
+  <a href="https://github.com/rustfs/migration/blob/main/README_KO.md">한국어</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_PT.md">Portuguese</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_RU.md">Русский</a>
 </p>
 
 `migration` は、S3 互換クラスタの間でオブジェクトを一方向にコピーします。対象は自前で運用する RustFS と MinIO、および S3 API を話すその他のエンドポイントです。リクエストは常に path-style です。この種のクラスタではそれが通常の呼び方です。
@@ -35,11 +35,13 @@
 | [README_ZH.md](README_ZH.md) | 简体中文 |
 | [README_DE.md](README_DE.md) | Deutsch |
 | [README_FR.md](README_FR.md) | français |
+| [README_ES.md](README_ES.md) | Español |
+| [README_KO.md](README_KO.md) | 한국어 |
+| [README_PT.md](README_PT.md) | Portuguese |
+| [README_RU.md](README_RU.md) | Русский |
 | [docs/USAGE.md](docs/USAGE.md) | 英語の短い補足 |
 | [docs/使用手册.md](docs/使用手册.md) | より詳しい中国語の手引き |
 | [docs/DESIGN.md](docs/DESIGN.md) | アーキテクチャと、ツールが緩めない制約 |
-
-Español、한국어、Portuguese、Русский は言語バーから readme-i18n で開きます。リポジトリには入っていません。
 
 `migration --help` と `migration <command> --help` は、英語と中国語のヘルプを出します。
 
