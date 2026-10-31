@@ -18,12 +18,14 @@ import (
 )
 
 type Metadata struct {
-	ContentType string
-	Metadata    map[string]string
+	ContentEncoding string
+	ContentType     string
+	Metadata        map[string]string
 }
 
 type object struct {
 	body []byte
+	etag string
 	lm   time.Time
 	meta Metadata
 }
@@ -96,6 +98,7 @@ func (s *Server) Put(bucket, key string, body []byte, lm time.Time, meta Metadat
 	}
 	s.buckets[bucket][key] = &object{
 		body: append([]byte(nil), body...),
+		etag: md5hex(body),
 		lm:   lm,
 		meta: meta,
 	}
@@ -288,7 +291,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPut && key == "" && q.Get("partNumber") == "":
 		s.createBucket(w, bucket)
 	case r.Method == http.MethodHead:
-		s.headObject(w, bucket, key)
+		s.headObject(w, r, bucket, key)
 	case r.Method == http.MethodGet:
 		s.getObject(w, r, bucket, key)
 	case r.Method == http.MethodPut && q.Get("partNumber") != "" && q.Get("uploadId") != "":
@@ -298,7 +301,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && q.Has("uploads"):
 		s.createMultipart(w, r, bucket, key)
 	case r.Method == http.MethodPost && q.Get("uploadId") != "":
-		s.completeMultipart(w, bucket, key, q.Get("uploadId"))
+		s.completeMultipart(w, r, bucket, key, q.Get("uploadId"))
 	case r.Method == http.MethodDelete && q.Get("uploadId") != "":
 		s.abortMultipart(w)
 	default:
@@ -372,7 +375,7 @@ func (s *Server) listObjects(w http.ResponseWriter, bucket string) {
 		obj := bkt[key]
 		b.WriteString(`<Contents><Key>` + xmlEscape(key) + `</Key>`)
 		b.WriteString(`<LastModified>` + obj.lm.UTC().Format(time.RFC3339) + `</LastModified>`)
-		b.WriteString(`<ETag>"` + md5hex(obj.body) + `"</ETag>`)
+		b.WriteString(`<ETag>"` + obj.etag + `"</ETag>`)
 		b.WriteString(`<Size>` + strconv.Itoa(len(obj.body)) + `</Size><StorageClass>STANDARD</StorageClass></Contents>`)
 	}
 	b.WriteString(`</ListBucketResult>`)
@@ -380,7 +383,7 @@ func (s *Server) listObjects(w http.ResponseWriter, bucket string) {
 	_, _ = w.Write([]byte(b.String()))
 }
 
-func (s *Server) headObject(w http.ResponseWriter, bucket, key string) {
+func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	release := s.enterFlight(&s.headDelay, &s.headInFlight, &s.headMax)
 	defer release()
 
@@ -395,8 +398,12 @@ func (s *Server) headObject(w http.ResponseWriter, bucket, key string) {
 		writeNoSuchKey(w)
 		return
 	}
+	if match := r.Header.Get("If-Match"); match != "" && match != `"`+obj.etag+`"` {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(obj.body)))
-	w.Header().Set("ETag", `"`+md5hex(obj.body)+`"`)
+	w.Header().Set("ETag", `"`+obj.etag+`"`)
 	w.Header().Set("Last-Modified", obj.lm.UTC().Format(http.TimeFormat))
 	writeMetadataHeaders(w, obj.meta)
 	w.WriteHeader(http.StatusOK)
@@ -434,23 +441,26 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		writeNoSuchKey(w)
 		return
 	}
-	value := obj.body
-	start, end := int64(0), int64(len(value)-1)
-	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
-		parts := strings.Split(strings.TrimPrefix(rangeHeader, "bytes="), "-")
-		parsedStart, _ := strconv.ParseInt(parts[0], 10, 64)
-		parsedEnd, _ := strconv.ParseInt(parts[1], 10, 64)
-		start, end = parsedStart, parsedEnd
-		w.WriteHeader(http.StatusPartialContent)
-	}
-	if start < 0 || end >= int64(len(value)) || start > end {
-		http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+	if match := r.Header.Get("If-Match"); match != "" && match != `"`+obj.etag+`"` {
+		w.WriteHeader(http.StatusPreconditionFailed)
 		return
 	}
-	chunk := value[start : end+1]
+	chunk := obj.body
+	status := http.StatusOK
+	if hdr := r.Header.Get("Range"); hdr != "" {
+		var start, end int
+		if _, err := fmt.Sscanf(hdr, "bytes=%d-%d", &start, &end); err != nil || start < 0 || end >= len(chunk) || start > end {
+			http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(chunk)))
+		chunk = chunk[start : end+1]
+		status = http.StatusPartialContent
+	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(chunk)))
-	w.Header().Set("ETag", `"`+md5hex(value)+`"`)
+	w.Header().Set("ETag", `"`+obj.etag+`"`)
 	writeMetadataHeaders(w, obj.meta)
+	w.WriteHeader(status)
 	_, _ = w.Write(chunk)
 }
 
@@ -478,8 +488,14 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	body, _ := io.ReadAll(r.Body)
 	s.mu.Lock()
 	s.ensureBucketLocked(bucket)
+	if _, exists := s.buckets[bucket][key]; exists && r.Header.Get("If-None-Match") == "*" {
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
 	s.buckets[bucket][key] = &object{
 		body: body,
+		etag: md5hex(body),
 		lm:   time.Date(2026, 5, 24, 11, 0, 0, 0, time.UTC),
 		meta: readMetadataHeaders(r),
 	}
@@ -527,7 +543,7 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, key string, 
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *Server) completeMultipart(w http.ResponseWriter, bucket, key, uploadID string) {
+func (s *Server) completeMultipart(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
 	s.mu.Lock()
 	parts := s.multipart[uploadID]
 	nums := make([]int, 0, len(parts))
@@ -540,8 +556,15 @@ func (s *Server) completeMultipart(w http.ResponseWriter, bucket, key, uploadID 
 		body = append(body, parts[num]...)
 	}
 	s.ensureBucketLocked(bucket)
+	if _, exists := s.buckets[bucket][key]; exists && r.Header.Get("If-None-Match") == "*" {
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
+	etag := fmt.Sprintf("%s-%d", md5hex(body), len(nums))
 	s.buckets[bucket][key] = &object{
 		body: body,
+		etag: etag,
 		lm:   time.Date(2026, 5, 24, 11, 0, 0, 0, time.UTC),
 		meta: s.uploadMeta[uploadID],
 	}
@@ -552,19 +575,12 @@ func (s *Server) completeMultipart(w http.ResponseWriter, bucket, key, uploadID 
 	delete(s.uploadKey, uploadID)
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/xml")
-	_, _ = fmt.Fprintf(w, `<CompleteMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><ETag>"%s-%d"</ETag></CompleteMultipartUploadResult>`, xmlEscape(bucket), xmlEscape(key), md5hex(body), len(nums))
+	_, _ = fmt.Fprintf(w, `<CompleteMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><ETag>"%s"</ETag></CompleteMultipartUploadResult>`, xmlEscape(bucket), xmlEscape(key), etag)
 }
 
 func parsePath(rawPath string) (bucket, key string) {
-	clean := strings.Trim(rawPath, "/")
-	if clean == "" {
-		return "", ""
-	}
-	bucket, rest, found := strings.Cut(clean, "/")
-	if !found {
-		return bucket, ""
-	}
-	key, _ = url.PathUnescape(rest)
+	// net/http has already decoded URL.Path. Slashes in the key are data.
+	bucket, key, _ = strings.Cut(strings.TrimPrefix(rawPath, "/"), "/")
 	return bucket, key
 }
 
@@ -584,6 +600,9 @@ func md5hex(value []byte) string {
 }
 
 func writeMetadataHeaders(w http.ResponseWriter, meta Metadata) {
+	if meta.ContentEncoding != "" {
+		w.Header().Set("Content-Encoding", meta.ContentEncoding)
+	}
 	if meta.ContentType != "" {
 		w.Header().Set("Content-Type", meta.ContentType)
 	}
@@ -594,8 +613,9 @@ func writeMetadataHeaders(w http.ResponseWriter, meta Metadata) {
 
 func readMetadataHeaders(r *http.Request) Metadata {
 	meta := Metadata{
-		ContentType: r.Header.Get("Content-Type"),
-		Metadata:    map[string]string{},
+		ContentType:     r.Header.Get("Content-Type"),
+		ContentEncoding: r.Header.Get("Content-Encoding"),
+		Metadata:        map[string]string{},
 	}
 	for key, values := range r.Header {
 		if !strings.HasPrefix(strings.ToLower(key), "x-amz-meta-") || len(values) == 0 {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -134,8 +135,8 @@ func TestResumeAfterTransientFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new migrator: %v", err)
 	}
-	if err := m1.Run(ctx); err != nil {
-		t.Fatalf("migrate run1: %v", err)
+	if err := m1.Run(ctx); err == nil {
+		t.Fatal("run1 reported success despite a failed upload")
 	}
 	_ = m1.Close()
 
@@ -438,7 +439,7 @@ func TestCanceledMultipartGetIsFailedNotSkipped(t *testing.T) {
 	// AbortMultipartUpload answers 404 NoSuchUpload. That text used to make
 	// IsNotFound true via "StatusCode: 404" / "NotFound" even though the
 	// GetObject itself was canceled and the source object still exists.
-	oldS3.SetFailAborts(8)
+	newS3.SetFailAborts(8)
 
 	cfg := testCfg(dbPath, conflictPath, tmp)
 	cfg.Workers = 1
@@ -461,7 +462,7 @@ func TestCanceledMultipartGetIsFailedNotSkipped(t *testing.T) {
 	}
 	select {
 	case err := <-errCh:
-		if err != nil {
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("migrate: %v", err)
 		}
 	case <-time.After(15 * time.Second):

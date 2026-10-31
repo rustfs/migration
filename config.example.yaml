@@ -1,6 +1,8 @@
 # migration 配置模板。
 # 优先级：命令行 > 环境变量 > 本文件 > 内置默认值。
 # Sample config. CLI flags override env, env overrides this file.
+# The target must honor If-None-Match: * on PutObject and CompleteMultipartUpload.
+# 目标端必须支持普通上传和完成分片上传时的条件写入，才能保留并发写入的同名对象。
 #
 # Env / 环境变量:
 #   OLD_ENDPOINT OLD_AK OLD_SK OLD_REGION
@@ -45,7 +47,7 @@ workers: 16
 multipart_threshold: 52428800   # 50 MiB
 
 # 每个分片的大小。省略或 0 = 16MiB。
-# 非末片必须 >= 5 MiB（5242880）。更小会在加载配置时失败，不会被改写。
+# 每片可配置为 5 MiB 至 5 GiB。实际最后一片可以更小。超出范围会在加载配置时失败。
 # 分片数要超过 S3 上限 10000 时，工具会自动加大分片，无需手算。
 multipart_part_size: 16777216   # 16 MiB
 

@@ -7,6 +7,7 @@ import (
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/rustfs/migration/internal/s3client"
 )
@@ -50,8 +51,19 @@ func EnsureBucket(ctx context.Context, cli *s3.Client, name string) error {
 	if !s3client.IsNotFound(err) {
 		return fmt.Errorf("head bucket %q on target: %w", name, err)
 	}
-	_, err = cli.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: awsv2.String(name)})
-	if err != nil && !s3client.IsAlreadyExists(err) {
+	return CreateBucket(ctx, cli, name)
+}
+
+// CreateBucket tolerates a concurrent creation by the same owner.
+func CreateBucket(ctx context.Context, cli *s3.Client, name string) error {
+	input := &s3.CreateBucketInput{Bucket: awsv2.String(name)}
+	if region := cli.Options().Region; region != "" && region != "us-east-1" {
+		input.CreateBucketConfiguration = &types.CreateBucketConfiguration{
+			LocationConstraint: types.BucketLocationConstraint(region),
+		}
+	}
+	_, err := cli.CreateBucket(ctx, input)
+	if err != nil && !s3client.IsAlreadyOwned(err) {
 		return fmt.Errorf("create bucket %q on target (need s3:CreateBucket): %w", name, err)
 	}
 	return nil

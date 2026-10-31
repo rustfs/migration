@@ -2,8 +2,7 @@ package config
 
 import (
 	"fmt"
-	"math"
-	"strconv"
+	"math/big"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -120,72 +119,24 @@ func rateMultiplier(suf string) (int64, error) {
 	case "ti", "tib":
 		return 1024 * 1024 * 1024 * 1024, nil
 	default:
-		return 0, fmt.Errorf("unknown size suffix %q (use B, K, KB, Ki, KiB, M, MB, Mi, MiB, G, GB, Gi, GiB)", suf)
+		return 0, fmt.Errorf("unknown size suffix %q (use B, K, KB, Ki, KiB, M, MB, Mi, MiB, G, GB, Gi, GiB, T, TB, Ti, TiB)", suf)
 	}
 }
 
 func scaleRate(num string, mult int64) (int64, error) {
-	whole, frac := num, ""
-	if dot := strings.IndexByte(num, '.'); dot >= 0 {
-		whole, frac = num[:dot], num[dot+1:]
-	}
-	if whole == "" {
-		whole = "0"
-	}
-	w, err := strconv.ParseInt(whole, 10, 64)
-	if err != nil {
-		if ne, ok := err.(*strconv.NumError); ok && ne.Err == strconv.ErrRange {
-			return 0, fmt.Errorf("rate limit overflows")
-		}
+	// The parser above only admits decimal digits and a decimal point. Scale
+	// before rounding so e.g. 0.000000001G still accounts for one byte/s.
+	rate, ok := new(big.Rat).SetString(num)
+	if !ok {
 		return 0, fmt.Errorf("rate limit %q is not a size", num)
 	}
-	if w < 0 {
-		return 0, fmt.Errorf("rate limit must be >= 0")
-	}
-	if mult != 0 && w > math.MaxInt64/mult {
+	rate.Mul(rate, new(big.Rat).SetInt64(mult))
+	whole := new(big.Int).Quo(rate.Num(), rate.Denom())
+	if !whole.IsInt64() {
 		return 0, fmt.Errorf("rate limit overflows")
 	}
-	base := w * mult
-	if frac == "" {
-		return base, nil
-	}
-	// Keep micro-unit precision. Longer tails cannot change an integer
-	// byte count once six digits are zero, and are rejected below when the
-	// whole value rounds down to zero.
-	origFrac := frac
-	if len(frac) > 6 {
-		frac = frac[:6]
-	}
-	fracInt, err := strconv.ParseInt(frac, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("rate limit %q is not a size", num)
-	}
-	pow := int64(1)
-	for range frac {
-		pow *= 10
-	}
-	var extra int64
-	if fracInt > 0 {
-		if mult > math.MaxInt64/fracInt {
-			return 0, fmt.Errorf("rate limit overflows")
-		}
-		extra = fracInt * mult / pow
-		if base > math.MaxInt64-extra {
-			return 0, fmt.Errorf("rate limit overflows")
-		}
-	}
-	total := base + extra
-	if total == 0 && !isZeroDecimal(whole+"."+origFrac) {
+	if whole.Sign() == 0 && rate.Sign() != 0 {
 		return 0, fmt.Errorf("rate limit is too small")
 	}
-	return total, nil
-}
-
-func isZeroDecimal(num string) bool {
-	for _, c := range num {
-		if c != '0' && c != '.' {
-			return false
-		}
-	}
-	return true
+	return whole.Int64(), nil
 }
