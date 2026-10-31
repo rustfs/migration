@@ -7,3 +7,4 @@
 conflict.log
 conflict-*.log
 config.yaml
+/dist/
