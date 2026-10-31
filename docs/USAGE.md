@@ -1,7 +1,8 @@
-# migration — English usage (short)
+# migration — English usage notes
 
-The operator manual is in Chinese: [使用手册.md](./使用手册.md).
-The README has the same commands in both languages.
+The English operator guide is the [README](../README.md): install, configuration, workflows, tuning, safety, and exit codes. This page is the short companion, so the rules that are easy to get wrong stay next to the commands.
+
+The Chinese handbook is [使用手册.md](./使用手册.md). Architecture and constraints are in [DESIGN.md](./DESIGN.md).
 
 ```bash
 cp config.example.yaml config.yaml
@@ -10,40 +11,70 @@ cp config.example.yaml config.yaml
 ./bin/migration diff -c config.yaml
 ```
 
-- Empty `bucket:` migrates every source bucket. `--bucket NAME` pins one.
-- `run` = scan + copy. `scan` / `migrate` stay available separately.
-- `scan` is single-threaded. `--workers` does not speed it up.
-- `--workers` (env `WORKERS`, default 16) is how many objects `run` / `migrate` copy at once, and how many keys `diff` HEADs at once.
-- `--multipart-concurrency` (env `MULTIPART_CONCURRENCY`, default 4) is how many parts of **one** large object upload together.
-- `--rate-limit` (env `RATE_LIMIT`, YAML `rate_limit`, default unlimited) is the aggregate bytes per second those workers may read from the source. `20M` / `20MB` = 20×1000×1000 B/s. `20Mi` / `20MiB` = 20×1024×1024 B/s. `0` or omit means unlimited at every layer.
-- Priority: CLI > environment > YAML > default. For the concurrency knobs, `0` in YAML means "default". A negative value, or an explicit `0` on the CLI or in the environment, is an error. For `rate_limit`, `0` is unlimited everywhere.
-- Peak HTTP per cluster is about `workers × multipart_concurrency`.
-- `diff` HEADs the target for every source key and exits 1 when anything is missing or mismatched. It never uploads.
-- Never overwrites. Never deletes. The first Ctrl-C cancels the pool; `migrate` resumes from SQLite. A second signal exits 130.
-- A target object that already matches the inventory (same size; same ETag when both are present and neither is a multipart ETag `hash-N`) is marked `done`, not `conflict`. A different size or comparable ETag is still a conflict and is never overwritten. A Ctrl-C after a successful PUT therefore resumes as `done` instead of a false conflict.
-- `skipped` is only a source 404 / NoSuchKey from a request that finished. `context.Canceled`, `context.DeadlineExceeded`, and `request canceled` are `failed` (the next `migrate` retries them), even when the error text also contains `NotFound` or `StatusCode: 404`.
-- `multipart_part_size` must be at least 5 MiB (5242880). S3 rejects a smaller non-final part with `EntityTooSmall`. The 16 MiB default is unchanged. A smaller configured value fails at config load and is not clamped upward.
+An empty `bucket:` migrates every source bucket. `--bucket NAME` pins one. `run` is scan plus copy. `scan` and `migrate` remain available on their own.
 
-## Limiting load
+## Commands
 
-`--rate-limit` (env `RATE_LIMIT`, YAML `rate_limit`) caps aggregate source-read bytes per second across every copy worker. `20M` is 20×1000×1000 B/s. `0` or omit is unlimited. Request fan-out is still concurrency:
+| Command | Effect |
+| --- | --- |
+| `list` | List source buckets. Read-only |
+| `run` | Scan, then copy. The command to use |
+| `scan` | Inventory into SQLite. Single-threaded. Does not write to the target |
+| `migrate` | Copy `pending` and `failed` rows only |
+| `status` | Local counters. No S3 calls |
+| `diff` | List the source live and `HEAD` the target. Exits 1 on a gap. Never uploads |
+| `diff --extra` | Also list keys that exist only on the target. Those keys are not a failure |
 
-| Field | Meaning | Default |
-| --- | --- | --- |
-| `workers` | Objects copied at once. Also the HEAD concurrency for `diff`. | 16 |
-| `multipart_concurrency` | Parallel parts of one large object (`run` / `migrate` only). | 4 |
-| `rate_limit` | Shared source-read cap for `run` / `migrate` object bodies. | unlimited |
+Shared flags: `-c/--config` (default `config.yaml`), `--bucket`, `--workers`, `--multipart-concurrency`, `--rate-limit`. Help text is bilingual. Full flag and workflow detail is in the [README](../README.md#commands).
 
-Peak in-flight requests are about `workers × multipart_concurrency`. The default `16 × 4` can still exhaust HAProxy `maxconn` even when `rate_limit` is set, because the cap counts bytes, not connections.
+## Knobs
 
-To protect production, start with `--rate-limit 20M` (or `30M` / `50M`). If the proxy returns 503, lower `workers` first, then `multipart_concurrency` for large objects. Watch `migration status` and the NIC (`status` does not call S3).
+Priority is **CLI > environment > YAML > default**.
+
+| Knob | Flag | Env | Default | Applies to |
+| --- | --- | --- | --- | --- |
+| Object workers | `--workers` | `WORKERS` | 16 | Copy in `run` / `migrate`, and HEAD in `diff` |
+| Parts of one large object | `--multipart-concurrency` | `MULTIPART_CONCURRENCY` | 4 | Multipart upload inside `run` / `migrate` |
+| Aggregate source read | `--rate-limit` | `RATE_LIMIT` | unlimited | Object bodies in `run` / `migrate` |
+
+`scan` stays single-threaded: `ListObjectsV2` is sequential, and the rows go into one SQLite file. `--workers` does not speed it up, and `rate_limit` does not apply to `scan`, `diff`, `list`, or `status`.
+
+Peak in-flight requests per cluster are about `workers × multipart_concurrency`. The byte cap does not lower that product. A proxy 503 is a concurrency problem: lower `workers` first, then `multipart_concurrency` for large objects. The default `16 × 4` can fill HAProxy `maxconn` even when `rate_limit` is set.
+
+Zero is not one rule:
+
+- YAML `workers: 0` or an omitted field means 16. The same for `multipart_concurrency` means 4. A negative value is an error.
+- `WORKERS=0`, `MULTIPART_CONCURRENCY=0`, `--workers 0`, and `--multipart-concurrency 0` are errors. An explicit zero does not fall back to the default.
+- `rate_limit: 0`, `RATE_LIMIT=0`, and `--rate-limit 0` are unlimited at every layer.
+
+`20M` and `20MB` are decimal: 20×1000×1000 bytes/s. `20Mi` and `20MiB` are binary: 20×1024×1024 bytes/s. `30M` and `50M` follow the decimal rule. A bare number is bytes/s. A trailing `/s` is ignored. Case does not matter.
+
+`multipart_part_size` must be at least 5 MiB (5242880). A smaller value fails at config load and is not raised. The 16 MiB default is unchanged. Past 10,000 parts, the tool grows the part size for that object.
+
+To protect a production source, start with `--rate-limit 20M` (or `30M` / `50M`) and watch `migration status` plus the NIC. `status` does not call S3. Lighter starting point while you watch:
 
 ```yaml
-# Starting point for a lighter run. Adjust after watching status and the NIC.
 workers: 2
 multipart_concurrency: 2
+rate_limit: 20M
 ```
 
-To go faster when the link has headroom: raise `workers` for many small objects, or raise `multipart_concurrency` / lower `multipart_part_size` (bytes, default 16 MiB, minimum 5 MiB; a smaller value fails at load and is not raised) for a single large object.
+Tuning ranges, the unit table, and spool-disk notes are in the README under [Concurrency](../README.md#concurrency) and [Rate limit](../README.md#rate-limit).
 
-Safety, the state machine, tuning, and troubleshooting: see the Chinese manual and `docs/DESIGN.md`.
+## Safety rules that the resume path depends on
+
+- Never overwrites. Never deletes. There is no overwrite mode to turn on.
+- A target object that already matches the inventory is `done`, not `conflict`. Size must match. ETags are compared only when both sides have one and neither is a multipart ETag (`hash-N`, any value containing `-`). A different size or a comparable ETag is a conflict and is never overwritten. A Ctrl-C after a successful PUT therefore resumes as `done` when the bytes match, instead of a false conflict.
+- `skipped` is only a source 404 / `NoSuchKey` from a request that finished. `context.Canceled`, `context.DeadlineExceeded`, and `request canceled` are `failed` (the next `migrate` retries them), even when the error text also contains `NotFound` or `StatusCode: 404`.
+- The first Ctrl-C cancels the pool and aborts an in-flight multipart upload without deleting a committed object. For a single bucket, that stop during the copy phase exits 0. A second signal exits 130.
+- `done` and `conflict` are terminal across a later scan. `pending`, `failed`, and `skipped` are refreshed and set back to `pending`. `ListObjectsV2` cannot filter by modification time, so a catch-up is a full list plus `migrate`.
+
+State, `diff` output, the conflict-log format, and the FAQ are in the README: [Resume and object state](../README.md#resume-and-object-state), [diff](../README.md#checking-the-target-with-diff), [Troubleshooting](../README.md#troubleshooting).
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success. A single-bucket copy also exits 0 on the first Ctrl-C. Unfinished rows stay in SQLite |
+| 1 | Bad config, a remote error, a failed bucket, a `diff` gap, Ctrl-C during scan, or an interrupt across more than one bucket |
+| 130 | Second `SIGINT` or `SIGTERM` |
