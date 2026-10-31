@@ -418,7 +418,7 @@ Recommended additional tests for production validation:
 - **End-to-end server-side checksums** (`x-amz-checksum-*`) once both clusters
   consistently support them, so multipart uploads can verify content rather
   than only size.
-- **Rate limiting** (objects/sec, bytes/sec) to protect HAProxy during peak
-  hours.
+- **Object-rate limiting** (objects/sec). Aggregate source-read bandwidth is
+  already capped by `rate_limit` / `--rate-limit`.
 - **Versioned buckets / delete markers / Object Lock** (explicitly out of
   scope today).

@@ -1,249 +1,360 @@
 # migration
 
-Safe one-way object migration between two S3-compatible clusters
-(RustFS / MinIO / S3). **Never overwrites. Never deletes. Resumable.**
+`migration` copies objects one way between two S3-compatible clusters. It targets self-hosted RustFS and MinIO, and any other endpoint that speaks the S3 API. Requests always use path-style addressing, which is the usual setup for those clusters.
 
-在两个 S3 兼容集群之间做安全的单向对象迁移。**永不覆盖、永不删除、可断点续传。**
+Run it next to live traffic. Three rules hold for every command that writes:
 
-完整中文手册：[docs/使用手册.md](docs/使用手册.md) · Short English notes: [docs/USAGE.md](docs/USAGE.md)
+- **Never overwrites.** Before any write, the tool calls `HeadObject` on the target. A match is recorded as finished. A different object is logged and left untouched.
+- **Never deletes.** The tool has no `DeleteObject` call. Aborting a multipart upload drops only that unfinished upload, not an object that was already committed.
+- **Resumable.** Every object has a row in a local SQLite database. Stop the process and start it again; finished work is not repeated.
 
----
+A common layout is an older cluster that still holds history, a newer cluster that receives all application writes, and an application that already reads from both. This tool backfills keys the target does not yet have. It will not replace a newer object on the target with older bytes from the source. Same-key conflicts are expected in that layout. Read `conflict.log` and resolve them by hand.
 
-## English (short)
+The copy carries the current object, plus `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`, `Expires`, and `x-amz-meta-*` user metadata. Version history, delete markers, Object Lock, bucket policies, and lifecycle rules stay where they are.
+
+In the config file the source cluster is `old` and the target cluster is `new`.
+
+中文操作手册：[docs/使用手册.md](docs/使用手册.md)。本文件是英文使用说明。
+
+## Documentation
+
+| Guide | What it is |
+| --- | --- |
+| This README | English install, configuration, commands, tuning, and safety |
+| [docs/USAGE.md](docs/USAGE.md) | Short English companion for the same behavior |
+| [docs/使用手册.md](docs/使用手册.md) | Full Chinese handbook |
+| [docs/DESIGN.md](docs/DESIGN.md) | Architecture and the constraints the tool will not relax |
+
+`migration --help` and `migration <command> --help` print bilingual English and Chinese help.
+
+## Quick start
+
+Go 1.22 or newer. SQLite is pure Go, so the binary does not need CGO.
 
 ```bash
-cp config.example.yaml config.yaml   # endpoints and keys
-go build -o bin/migration .
-./bin/migration run  -c config.yaml --workers 16 --rate-limit 20M
-./bin/migration diff -c config.yaml
+git clone https://github.com/rustfs/migration.git
+cd migration
+cp config.example.yaml config.yaml   # source and target endpoints and keys
+CGO_ENABLED=0 go build -o bin/migration .
+# or: make build
+
+./bin/migration list   -c config.yaml
+./bin/migration run    -c config.yaml --workers 16 --rate-limit 20M
+./bin/migration status -c config.yaml
+./bin/migration diff   -c config.yaml
 ```
 
-| Command | What it does |
-| --- | --- |
-| `list` | List source buckets (read-only) |
-| `run` | Scan, then copy. Recommended |
-| `scan` | Inventory into SQLite. Single-threaded |
-| `migrate` | Copy `pending` / `failed` rows only |
-| `status` | Local counters, no S3 calls |
-| `diff` | HEAD the target for every source key |
+Leave `bucket:` empty to migrate every bucket on the source. Set `bucket: photos`, or pass `--bucket photos`, to pin one bucket.
 
-Leave `bucket:` empty to migrate every source bucket. `--bucket NAME` pins one.
+`20M` is a decimal megabyte per second: 20×1000×1000 bytes/s. See [Rate limit](#rate-limit) before raising it on a shared network.
 
-Two concurrency knobs, both overridable from the CLI:
-
-| Knob | Flag | Env | Default | Applies to |
-| --- | --- | --- | --- | --- |
-| Object workers | `--workers` | `WORKERS` | 16 | `run` / `migrate` copy, and `diff` HEAD |
-| Parts of one large object | `--multipart-concurrency` | `MULTIPART_CONCURRENCY` | 4 | multipart upload inside `run` / `migrate` |
-
-Priority is **CLI > environment > YAML > default**. `scan` stays single-threaded because `ListObjectsV2` is sequential. Peak in-flight requests per cluster are about `workers × multipart_concurrency`.
-
-One bandwidth cap, shared by every copy worker (including parts of a large object):
-
-| Knob | Flag | Env | Default | Applies to |
-| --- | --- | --- | --- | --- |
-| Aggregate source read | `--rate-limit` | `RATE_LIMIT` | unlimited (`0` or omit) | object bodies in `run` / `migrate` |
-
-`20M` and `20MB` are **decimal**: 20×1000×1000 bytes/s. `20Mi` and `20MiB` are **binary**: 20×1024×1024 bytes/s. `30M` and `50M` follow the same decimal rule. A bare number is bytes/s. `scan`, `diff`, and `list` do not read object bodies, so the cap does not apply to them. `0` means unlimited at every layer (CLI, env, and YAML). That is different from `workers`, where YAML `0` means the default of 16.
-
-`HeadObject` runs before every write. A matching object (same size and comparable ETag) is `done`; mismatches go to `conflict.log` and are never overwritten. There is no `DeleteObject`. A finished source 404 is `skipped`; cancel and deadline are `failed`. Ctrl-C cancels the pool; run `migrate` again to resume from SQLite.
-
-```text
-./bin/migration --help
-./bin/migration run --help
-```
-
----
-
-## 中文使用说明
-
-### 1. 安装编译
-
-需要 Go 1.22 或更高版本。SQLite 是纯 Go 实现，**不需要 CGO**。
+## Install
 
 ```bash
 git clone https://github.com/rustfs/migration.git
 cd migration
 CGO_ENABLED=0 go build -o bin/migration .
-# 或
-make build
 ```
 
-得到静态二进制 `bin/migration`。
+`make build` runs the same command. The result is a static binary at `bin/migration`. `make test` runs `go test ./...`.
 
-### 2. 配置
+Protect `config.yaml` (`chmod 600` is a reasonable default). The process logs endpoints and object keys. It does not log credentials.
+
+## Configuration
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-最少要填来源和目标的地址、Access Key、Secret Key。地址按 **path-style** 访问（自建 RustFS / MinIO 的常见方式）。
+The minimum is an endpoint, access key, and secret key for each side. The target key needs `s3:CreateBucket` when the bucket is not already there. An existing target bucket is left as it is.
 
 ```yaml
-old:                              # 来源，只读
+old:                              # source, read-only
   endpoint: "http://10.0.0.1:9000"
   access_key: "OLD_AK"
   secret_key: "OLD_SK"
   region: "us-east-1"
-new:                              # 目标，读 + 写，需要能 CreateBucket
+new:                              # target, read and write
   endpoint: "http://haproxy.new.local:9000"
   access_key: "NEW_AK"
   secret_key: "NEW_SK"
   region: "us-east-1"
 
-bucket: ""                        # 空 = 来源上的每一个桶
+bucket: ""                        # empty = every bucket on the source
 db_path: "./migration.db"
 conflict_log: "./conflict.log"
-spool_dir: ""                     # 小对象临时目录，默认跟 db 同目录
+spool_dir: ""                     # small-object temp dir; default is the db directory
 
-workers: 16                       # 对象并发，默认 16
-multipart_threshold: 52428800     # >= 50MiB 走分片
-multipart_part_size: 16777216     # 分片大小 16MiB
-multipart_concurrency: 4          # 单个大对象的分片并发，默认 4
-rate_limit: 0                     # 源读取合计上限。0 = 不限速。20M = 20000000 字节/秒
+workers: 16                       # objects at once; 0 or omit = 16
+multipart_threshold: 52428800     # >= 50 MiB uses multipart upload
+multipart_part_size: 16777216     # 16 MiB; must be >= 5 MiB (5242880)
+multipart_concurrency: 4          # parts of one large object; 0 or omit = 4
+rate_limit: 0                     # aggregate source-read cap; 0 or omit = unlimited
 ```
 
-`bucket:` 留空会迁移来源上的**每一个桶**。只迁一个桶时写成 `bucket: photos`，或命令行加 `--bucket photos`。
+`list` and `scan` need the source endpoint and keys. `run`, `migrate`, and `diff` need both sides.
 
-环境变量覆盖 YAML，适合容器和密钥管理：
+### Precedence
 
-`OLD_ENDPOINT` `OLD_AK` `OLD_SK` `OLD_REGION`  
-`NEW_ENDPOINT` `NEW_AK` `NEW_SK` `NEW_REGION` `REGION`  
-`BUCKET` `DB_PATH` `CONFLICT_LOG` `SPOOL_DIR`  
-`WORKERS` `MULTIPART_CONCURRENCY` `RATE_LIMIT`
+Highest priority wins:
 
-优先级：**命令行 > 环境变量 > YAML > 默认值**。YAML 里把 `workers` 或 `multipart_concurrency` 写成 `0` 或省略，表示用默认值（16 和 4）。写成负数会直接报错。命令行一旦写了 `--workers` / `--multipart-concurrency`，值必须 `>= 1`。
+1. CLI: `--bucket`, `--workers`, `--multipart-concurrency`, `--rate-limit`
+2. Environment variables
+3. YAML
+4. Built-in defaults
 
-`rate_limit` 是另一回事：省略或写成 `0` 表示**不限速**，命令行 `--rate-limit 0` 和环境变量 `RATE_LIMIT=0` 也是不限速。它限制的是所有复制 worker 从源读取对象字节的合计速度，不是再开一条并发。
+| Setting | Default when omitted |
+| --- | --- |
+| `workers` | 16 |
+| `multipart_concurrency` | 4 |
+| `multipart_threshold` | 50 MiB (52428800) |
+| `multipart_part_size` | 16 MiB (16777216) |
+| `rate_limit` | unlimited |
+| `db_path` | `./migration.db` |
+| `conflict_log` | `./conflict.log` |
+| `spool_dir` | directory of `db_path` |
+| `region` | `us-east-1` |
 
-### 3. 常用命令
+Example: YAML `workers: 8`, environment `WORKERS=32`, and `--workers 4` together use **4**.
+
+### What zero means
+
+`0` is not the same knob on every field.
+
+| Field | YAML `0` or omitted | Environment `0` | CLI `0` |
+| --- | --- | --- | --- |
+| `workers` | default 16 | error | error (`--workers 0`) |
+| `multipart_concurrency` | default 4 | error | error |
+| `multipart_threshold` | default 50 MiB | no env var | no flag |
+| `multipart_part_size` | default 16 MiB | no env var | no flag |
+| `rate_limit` | unlimited | unlimited (`RATE_LIMIT=0`) | unlimited (`--rate-limit 0`) |
+
+A negative concurrency or size fails at startup. `WORKERS` and `MULTIPART_CONCURRENCY` must be plain integers. Put size suffixes on `RATE_LIMIT` only: `RATE_LIMIT=20M` is valid, `WORKERS=20M` is not.
+
+`multipart_part_size` must be at least 5 MiB (5242880). S3 rejects a smaller non-final part with `EntityTooSmall`. A smaller value fails when the config is loaded. It is not raised for you. If one object would need more than 10,000 parts, the tool grows that object's part size so the upload fits.
+
+A bucket name must not contain whitespace or `/`.
+
+### Environment variables
+
+Set variables override the YAML values. Unset variables leave the file alone.
+
+| Variable | Overrides |
+| --- | --- |
+| `OLD_ENDPOINT` `OLD_AK` `OLD_SK` `OLD_REGION` | source endpoint |
+| `NEW_ENDPOINT` `NEW_AK` `NEW_SK` `NEW_REGION` | target endpoint |
+| `REGION` | either side whose region is still empty after the specific variables |
+| `BUCKET` | `bucket` |
+| `DB_PATH` `CONFLICT_LOG` `SPOOL_DIR` | local paths |
+| `WORKERS` `MULTIPART_CONCURRENCY` | concurrency (integer ≥ 1) |
+| `RATE_LIMIT` | aggregate source-read cap (`20M`, `20MiB`, `0`, …) |
+
+## Commands
 
 ```bash
 ./bin/migration --help
 ./bin/migration run --help
+./bin/migration diff --help
 ```
 
-| 命令 | 作用 | 是否写目标 |
-| --- | --- | --- |
-| `migration list -c config.yaml` | 列出源集群全部桶 | 否 |
-| `migration run -c config.yaml` | **推荐**。先扫描再复制 | 是（但不覆盖） |
-| `migration scan -c config.yaml` | 只扫描，写入本地 SQLite | 否 |
-| `migration migrate -c config.yaml` | 只复制 SQLite 里 pending/failed | 是 |
-| `migration status -c config.yaml` | 看本地进度，不访问 S3 | 否 |
-| `migration diff -c config.yaml` | 按源清单对目标做 HEAD | 否 |
-| `migration diff --extra -c config.yaml` | 同上，并列出仅目标上有的 key | 否 |
+| Command | What it does | Writes to the target | Concurrency and cap |
+| --- | --- | --- | --- |
+| `migration list -c config.yaml` | List every bucket on the source | No | None |
+| `migration run -c config.yaml` | **Recommended.** Scan, then copy | Yes, without overwriting | Scan is single-threaded. Copy uses `workers`, `multipart_concurrency`, and `rate_limit` |
+| `migration scan -c config.yaml` | Inventory the source into SQLite | No | Single-threaded. No rate limit |
+| `migration migrate -c config.yaml` | Copy SQLite rows in `pending` or `failed` | Yes, without overwriting | `workers`, `multipart_concurrency`, and `rate_limit` |
+| `migration status -c config.yaml` | Print local counters | No | None. No S3 calls |
+| `migration diff -c config.yaml` | List the source and `HEAD` each key on the target | No | `workers` for parallel HEAD. No rate limit |
+| `migration diff --extra -c config.yaml` | Same, and list keys that exist only on the target | No | `workers` |
 
-通用参数：
+Flags shared by every command:
 
-- `-c, --config` 配置文件，默认 `config.yaml`
-- `--bucket NAME` 覆盖 YAML 里的桶名
-- `--workers N` 对象并发，覆盖配置。`run` / `migrate` 同时复制 N 个对象，`diff` 同时 HEAD N 个对象
-- `--multipart-concurrency N` 单个大对象内部的分片并发，覆盖配置
-- `--rate-limit SIZE` 所有 worker 从源读取的合计上限。`20M`、`30M`、`50M` 都是十进制 MB/s；`0` 表示不限速
-- `--help` 中英双语帮助
-- `--version` 版本号
+| Flag | Meaning |
+| --- | --- |
+| `-c`, `--config` | Config file. Default `config.yaml` |
+| `--bucket NAME` | Pin one bucket. Overrides YAML and `BUCKET` |
+| `--workers N` | Objects copied at once for `run` / `migrate`, and parallel HEAD for `diff`. Must be ≥ 1 |
+| `--multipart-concurrency N` | Parts uploaded at once inside one large object. Must be ≥ 1. Ignored by `list`, `scan`, `status`, and `diff` |
+| `--rate-limit SIZE` | Aggregate source-read cap for object bodies in `run` / `migrate`. `0` is unlimited |
+| `--version` | Print the version |
+| `--help` | Bilingual help |
 
-`--rate-limit` 限制的是从源读取的合计字节。在途请求峰值仍大约是 `workers × multipart_concurrency`，代理 `maxconn` 要撑得住这个乘积。详见手册 §9。
+`diff` also accepts `--extra`.
 
-目标上已有且与清单一致的对象记为 `done`，不再上传。大小或可比 ETag 不一致才写入 `conflict.log`，并且永不覆盖。
+`status` prints `BUCKET`, `TOTAL`, `PENDING`, `DONE`, `CONFLICT`, `SKIPPED`, and `FAILED`. With no bucket pinned, it reads `migration-*.db` next to `db_path`, and the configured database itself when that file is already bound to a bucket. If nothing is there yet, it says so and exits 0. Run `scan` or `run` first.
 
-全量迁移：
+## Workflows
+
+### Migrate every bucket
 
 ```bash
 ./bin/migration list   -c config.yaml
-./bin/migration run    -c config.yaml --workers 16
+./bin/migration run    -c config.yaml --workers 16 --rate-limit 20M
 ./bin/migration status -c config.yaml
 ./bin/migration diff   -c config.yaml --workers 32
 ```
 
-只迁一个桶，并把大文件分片并行度调到 8：
+For each bucket, `run` does the following:
+
+1. `HeadBucket` on the source.
+2. Create the bucket on the target when it is missing. An existing bucket is not modified.
+3. `ListObjectsV2` the source into SQLite. This step is single-threaded.
+4. Start `workers` copy goroutines. Each object is checked with `HeadObject` on the target first. A missing key is read from the source and written to the target. Those source reads share `rate_limit`. A key that already matches the inventory is marked `done` and is not uploaded. A key that exists and does not match is appended to the conflict log and is not overwritten.
+5. An object at or above `multipart_threshold` uploads its parts with `multipart_concurrency`. Those parts share the same byte cap.
+6. Check the size on the target. A single-part object is also checked by ETag when the ETags are comparable. See [Object state](#resume-and-object-state).
+
+Buckets are copied one after another, so `rate_limit` is the cap for the whole process.
+
+### One bucket
 
 ```bash
-./bin/migration run -c config.yaml --bucket photos --workers 8 --multipart-concurrency 8
+./bin/migration run -c config.yaml \
+  --bucket photos --workers 8 --multipart-concurrency 8 --rate-limit 30M
 ```
 
-生产时段把源读取压在 20MB/s（十进制），避免占满业务带宽：
+### Objects added on the source later
 
-```bash
-./bin/migration run -c config.yaml --workers 16 --rate-limit 20M
-# 30M = 30000000 字节/秒，50M = 50000000 字节/秒
-# 若要 20×1024×1024，写成 --rate-limit 20MiB
-```
-
-源上后来又写入了新对象时，再扫一遍再补拷（S3 List **不能**按修改时间在服务端过滤）：
+`ListObjectsV2` cannot filter by modification time on the server. Catch-up is another full listing. New keys become `pending`. Rows that were `failed` or `skipped` return to `pending` when they are listed again. Rows that are `done` or `conflict` stay as they are, so a second pass does not re-upload them and does not overwrite the target.
 
 ```bash
 ./bin/migration scan    -c config.yaml
-./bin/migration migrate -c config.yaml
+./bin/migration migrate -c config.yaml --workers 16
 ./bin/migration diff    -c config.yaml
 ```
 
-也可以直接再跑一次 `run`。已经是 `done` / `conflict` 的对象不会被重传，也不会被覆盖。
+`run` again is the same two steps in one command.
 
-### 4. 并发参数调优
+### Inventory first
 
-两个旋钮不要混用：
+```bash
+./bin/migration scan   -c config.yaml
+./bin/migration status -c config.yaml    # object counts, no S3 calls
+./bin/migration migrate -c config.yaml --workers 16
+```
 
-| 参数 | 管什么 | 什么时候加大 | 什么时候减小 |
+## Concurrency
+
+Three controls, and they do different jobs:
+
+| Control | What it limits | Raise it when | Lower it when |
 | --- | --- | --- | --- |
-| `workers` / `--workers` | 同时处理多少个**对象** | 小文件非常多，CPU、带宽、代理都还有余量 | 出现 503、连接超时、源盘打满，或要排错（用 `1`） |
-| `multipart_concurrency` / `--multipart-concurrency` | **一个大对象里面**同时传多少个分片 | 单个对象很大，想把这块磁盘和网络吃满 | 大对象已经把带宽占满，或多个大对象叠在一起把代理打满 |
-| `rate_limit` / `--rate-limit` | 所有 worker **合计**每秒从源读多少字节 | 需要再快，且源和网络有余量 | 业务还在用源集群或同一条网卡。生产上从 `20M` 起，再试 `30M`、`50M` |
+| `workers` / `--workers` | How many **objects** are in flight. Also the HEAD parallelism for `diff` | Mostly small objects, and CPU, disk, and the proxy still have headroom | 503s, timeouts, a saturated source disk, or you are debugging one object (`--workers 1`) |
+| `multipart_concurrency` / `--multipart-concurrency` | How many **parts of one large object** upload together | A single object is large and that flow can use more of the link | Large objects already fill the link, or several of them together fill the proxy |
+| `rate_limit` / `--rate-limit` | How many **source bytes per second** all of those workers may read, combined | The source and the network still have headroom | Production is using the source cluster or the same NIC. Start at `20M`, then try `30M` or `50M` |
 
-`scan` **不使用** `workers`，也不吃 `rate_limit`。列目录必须一页接一页拿 continuation token，结果还要写入同一个 SQLite 文件，所以扫描保持单线程。觉得扫描慢，不是 `--workers` 能解决的。`diff` 和 `list` 只做 HEAD / List，不读对象正文，同样不限速。
+`scan` ignores `workers` and `rate_limit`. Listing is one page after another because each page needs the previous continuation token, and the rows land in one SQLite file. A slow scan is not fixed by `--workers`. `list`, `diff`, and `status` do not read object bodies, so the byte cap does not apply to them. `diff` does use `--workers` for HEAD.
 
-经验起点：
+```text
+workers = 4 objects at once
+  object A (small)  ── one GET + PUT
+  object B (small)  ── one GET + PUT
+  object C (large)  ── multipart_concurrency ranged GETs + UploadPart
+  object D (large)  ── the same
+```
 
-- 小文件（KB～几 MB）为主：`workers` 16～64，`multipart_concurrency` 保持 4（基本用不上）
-- 大小混合：`workers` 8～32，`multipart_concurrency` 4～8
-- 少量超大对象：把 `workers` 降到 2～8（每个对象自己已经很占带宽），`multipart_concurrency` 4～16
+Peak in-flight requests against one cluster are about `workers × multipart_concurrency`. A small object uses one request. An object at the multipart threshold multiplies by the part concurrency. The default `16 × 4` is 64. HAProxy or Nginx `maxconn`, and the disks on both clusters, have to carry that product.
 
-峰值大约是 `workers × multipart_concurrency` 个打到**同一个集群**的在途请求。`16 × 4 = 64`。HAProxy / Nginx 的 `maxconn`、源盘、目标盘都要撑得住这个乘积。工具会按这个乘积加大 HTTP 空闲连接，避免 Go 默认每个主机只留 2 条空闲连接；这是连接复用，不是第二道硬限制。
+The HTTP client raises idle connections per host to follow that product (capped at 1024), instead of Go's default of two idle connections per host. That is connection reuse. The worker pool and the part semaphore are what bound in-flight work. The waiting queue holds at most 2048 object descriptors, so a large `--workers` does not load the whole bucket into memory.
 
-带宽和并发是两层。`workers` 决定同时有几个对象在飞，`rate_limit` 决定这些对象加在一起每秒能从源读多少字节。限额是所有 worker、所有分片共用的一个令牌桶。桶按顺序迁移，所以这也是整个进程的上限。
+Starting points:
 
-单位：
+| Workload | Suggestion |
+| --- | --- |
+| Many small objects (kilobytes to a few megabytes), link has room | `workers` 16–64, leave `multipart_concurrency` at 4 |
+| Mixed sizes | `workers` 8–32, `multipart_concurrency` 4–8 |
+| A few very large objects | `workers` 2–8, `multipart_concurrency` 4–16 |
+| One object failing and the log is hard to read | `--workers 1` |
+| Proxy returns 503, timeouts, or the source disk is full | Lower `workers` first. If the slow objects are large, lower `multipart_concurrency` as well |
+| Keep production bandwidth | `--rate-limit 20M`, then `30M` or `50M` after the source looks healthy. `0` removes the cap |
+| Faster small objects | Raise `workers` |
+| Faster one large object | Raise `multipart_concurrency`, or lower `multipart_part_size` (bytes, minimum 5 MiB) |
 
-| 写法 | 每秒字节数 | 说明 |
-| --- | --- | --- |
-| `20M`、`20MB` | 20×1000×1000 = 20000000 | 十进制 MB，不是 1024 |
-| `30M` | 30000000 | 同上 |
-| `50M`、`50MB` | 50000000 | 同上 |
-| `20Mi`、`20MiB` | 20×1024×1024 = 20971520 | 二进制 MiB |
-| `0` 或省略 | 不限速 | 命令行、环境变量、YAML 都一样 |
-| `1048576` | 1048576 | 裸数字就是字节/秒 |
+During a copy, a progress line is logged about every 10 seconds: processed, copied, conflicts, skipped, failed, and bytes.
 
-`K`/`KB` = 1000，`Ki`/`KiB` = 1024；`G`/`GB` = 1000³，`Gi`/`GiB` = 1024³。大小写不敏感。
+Each small object in flight has one temp file in `spool_dir`, up to about `multipart_threshold` bytes, because `PutObject` needs a seekable body. If `/tmp` is a memory disk, point `spool_dir` at a real disk. More workers means more of those files at once.
 
-计量的是从**源集群读出的对象字节**。小对象先按这个速度读完再上传，源侧读取不会超过该值；读完之后的上传不重复计费，目标侧可能短时更高。迁移机如果和业务共用网卡，写入还会再占一段带宽，额度请留余量（例如希望网卡总占用不超过约 40MB/s，先设 `20M`）。限速只让复制变慢：已存在的对象仍然跳过，不覆盖、不删除。Ctrl-C 会打断正在等待的限额，没传完的对象留在 SQLite，下次 `migrate` 继续。
+Use one process per database file. SQLite is opened in WAL mode with a single connection inside the process, so status updates stay serialized while object bytes stay on the worker pool. A second process on the same file still reports `database is locked`.
 
-`workers` 变大时，每个正在复制的小对象会在 `spool_dir` 里占一个临时文件（最大约等于 `multipart_threshold`）。`/tmp` 如果是内存盘，把 `spool_dir` 指到真实磁盘。
+## Rate limit
 
-同一个 `db_path` 不要开两个进程一起写。SQLite 使用 WAL，进程内用一条连接串行更新状态，对象数据本身仍由 worker 并行搬运。
+`rate_limit` is one shared token bucket for every copy worker, including the parts of a large object. It counts bytes read from source object bodies. List, HEAD, and the pre-write conflict check are outside the cap. The upload that follows a completed read is outside the cap as well.
 
-### 5. 断点续传
+A small object is read from the source at the cap, then written to the target. Source reads stay within the cap. The following write can be briefly faster. If the migration host shares a NIC with production, that write still uses bandwidth on top of the capped read. When total NIC use should stay near 40 MB/s, start at `20M`.
 
-第一次 `Ctrl-C`（或 `SIGTERM`）会取消 worker：没开始的对象留在 SQLite 里，进行中的分片会 `AbortMultipartUpload`（只放弃这次未完成的上传，**不会删除**已提交的对象）。再按一次强制退出，退出码 `130`。
+The cap slows copies. It does not overwrite, and it does not delete. An object that already matches the inventory is still skipped. The first Ctrl-C cancels a read that is waiting for tokens. The unfinished object stays in SQLite for the next `migrate`.
+
+The cap does not reduce how many requests are in flight. A proxy that returns 503 is still a concurrency problem: lower `workers`, then `multipart_concurrency`.
+
+### Units
+
+Suffixes are case-insensitive. A trailing `/s` is accepted and ignored. A bare number is bytes per second. `1.5M` is 1,500,000 bytes/s.
+
+| Written as | Bytes per second |
+| --- | --- |
+| `20M`, `20MB` | 20×1000×1000 = 20000000 |
+| `30M` | 30000000 |
+| `50M`, `50MB` | 50000000 |
+| `20Mi`, `20MiB` | 20×1024×1024 = 20971520 |
+| `2K`, `2KB` | 2000 |
+| `2Ki`, `2KiB` | 2048 |
+| `1G`, `1GB` | 1000000000 |
+| `1Gi`, `1GiB` | 1073741824 |
+| `1T`, `1TB` / `1Ti`, `1TiB` | 1000⁴ / 1024⁴ |
+| `1048576` | 1048576 |
+| `0`, `0M`, or omit | unlimited |
+
+`M` is decimal. `Mi` is binary. `20M` is about 5% under `20MiB` (20000000 versus 20971520). A negative value or an unknown suffix fails at startup.
+
+```yaml
+rate_limit: 20M
+```
+
+```bash
+RATE_LIMIT=30M ./bin/migration run -c config.yaml
+./bin/migration migrate -c config.yaml --rate-limit 50M
+./bin/migration run -c config.yaml --rate-limit 0    # unlimited, on purpose
+```
+
+## Resume and object state
+
+The first Ctrl-C or `SIGTERM` cancels the worker pool. Objects that have not started stay `pending`. An in-flight multipart upload is aborted, which releases that upload and does not delete a committed object. State already written to SQLite is kept. A second signal exits immediately with code 130.
+
+If the target `PutObject` succeeded and the row was not yet marked `done`, the row stays `failed` (or `pending`) even though the object is on the target. The next `migrate` checks the target with `HeadObject`. When the size matches and any comparable ETag matches, the row is marked `done`. When the size differs, or a comparable ETag differs, the row is marked `conflict`, and the object is still not overwritten.
+
+A canceled request, a deadline, and `request canceled` are `failed`, including when the error text also contains `NotFound` or `StatusCode: 404`. A multipart abort often reports `NoSuchUpload`. That is not a missing source object. `skipped` means the source request finished and the object was really gone.
 
 ```bash
 ./bin/migration migrate -c config.yaml
 ```
 
-`migrate` 只重试 `pending` 和 `failed`。已经 `done` 或 `conflict` 的行不会重传。
+`migrate` retries `pending` and `failed` only.
 
-每个对象一行状态：
-
-| 状态 | 含义 | 再扫描会改吗 |
+| State | Meaning | A later scan |
 | --- | --- | --- |
-| `pending` | 待拷 | 会更新 size/etag |
-| `failed` | 上次失败，`migrate` 会重试 | 会回到 pending |
-| `skipped` | 源请求完整返回 404。取消或超时是 `failed`，不是 `skipped` | 对象后来又出现时会回到 pending |
-| `done` | 已拷到目标并校验，或目标上已有一致对象 | 不会动 |
-| `conflict` | 目标已有同名对象，且与清单不一致，未覆盖 | 不会动 |
+| `pending` | Waiting to copy | Refreshes size and ETag |
+| `failed` | Last attempt failed. `migrate` retries it. `last_error` has the message | Returns the row to `pending` |
+| `skipped` | The source request finished with 404 / `NoSuchKey` | Returns the row to `pending` if the key is listed again |
+| `done` | Copied and checked, or the target already matched the inventory | Left unchanged |
+| `conflict` | The target has the key and it does not match the inventory. Not overwritten | Left unchanged |
 
-单桶模式使用你配置的 `db_path` / `conflict_log`。全桶模式自动变成 `migration-<桶名>.db` 和 `conflict-<桶名>.log`。
+**Match rule.** Size must equal the inventoried size. ETags are compared only when both sides have one and neither is a multipart ETag (a value containing `-`, shaped like `hash-N`). Multipart ETags depend on part boundaries, so they are not compared; size is the check. A different size, or a comparable ETag that differs, is a conflict.
 
-### 6. diff 校验
+Each conflict is one TSV line in the conflict log, with RFC3339 UTC timestamps:
+
+```text
+<object-key>	<source-LastModified>	<target-LastModified>
+```
+
+One configured bucket uses `db_path` and `conflict_log` as written. Every-bucket mode derives sibling files:
+
+- `migration-<bucket>.db`
+- `conflict-<bucket>.log`
+
+One database file is bound to one bucket. Pointing it at another bucket fails with `db_path is bound to bucket "…"`.
+
+## Checking the target with `diff`
+
+`diff` lists the source bucket live and `HEAD`s each key on the target. It does not read the migration SQLite inventory, and it does not upload.
 
 ```bash
 ./bin/migration diff -c config.yaml --workers 32
@@ -258,49 +369,63 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
   etag     b.txt  src=abc dst=def
 ```
 
-- **missing**：源有、目标没有。再跑 `migrate` 或 `run`
-- **size / etag**：同名但内容对不上。本工具不会覆盖，需要人工处理
-- **extra_on_target**（需 `--extra`）：只在目标上，通常是业务已经写到新集群，**不算失败**
+The second summary line repeats the counters in Chinese, because that is what the command prints. At most 50 issue lines are shown; the rest are counted in a trailing “and N more” line.
 
-有 missing、size 或 etag 时退出码为 `1`。`--workers` 只决定 HEAD 的并行度，diff 不会上传。
-
-### 7. 安全模型
-
-| 保证 | 做法 |
+| Result | Meaning |
 | --- | --- |
-| 永不覆盖目标对象 | 写之前强制 `HeadObject`。一致则记 `done`；不一致才记入 `conflict.log` 并跳过 |
-| 永不删除 | 没有 `DeleteObject`。分片失败只 `AbortMultipartUpload` |
-| 不走错桶 | `HeadBucket`，每页校验桶名，SQLite 绑定桶名 |
-| 源中途被删 | 只有完整返回的源 404 记 `skipped`；取消或超时记 `failed` |
-| 崩溃可续 | 每个对象的状态写在 SQLite WAL 里 |
-| 内存有上限 | 小对象落盘；大对象按分片读 |
-| 拷后校验 | 比对 size；单分片对象再比 ETag |
+| `missing` | On the source, not on the target. Run `migrate` or `run` again |
+| `size` / `etag` | Same key, contents do not match. Often a live write on the target. This tool will not overwrite it |
+| `extra` | Only on the target. Reported with `--extra`. Usually a write that already landed on the new cluster. Not a failure |
 
-不迁移：版本历史、删除标记、Object Lock、桶策略、生命周期规则。
+Exit code is 1 when any key is missing or mismatched in size or ETag. `extra_on_target` does not fail the command. With several buckets, a gap fails that bucket and the command continues with the rest, then exits 1 if any bucket failed.
 
-同名冲突是预期现象。新集群上更新过的对象不会被旧内容盖掉。请看 `conflict.log`，不要改成覆盖模式。
+## Safety
 
-### 8. 常见问题
-
-| 现象 | 处理 |
+| Guarantee | How |
 | --- | --- |
-| `old.endpoint is required` | 检查 YAML 或 `OLD_ENDPOINT` |
-| `workers must be >= 1` | `--workers`、`WORKERS` 或 YAML 里的 `workers` 小于 1。`0` 只在 YAML 里表示「用默认 16」；命令行和环境变量写 `0` 会报错 |
-| `multipart_concurrency must be >= 1` | 同上，针对分片并发 |
-| `unknown size suffix` / `rate limit` | `--rate-limit`、`RATE_LIMIT` 或 YAML 的 `rate_limit` 写了无法识别的单位。`20M` 是十进制；1024 进制要写 `20Mi` 或 `20MiB` |
-| 设了 `20M` 仍然觉得源很忙 | `20M` = 20000000 字节/秒。上传不重复计入这个额度，共用网卡时把数字再调低 |
-| 扫描或 diff 没有变慢 | 正常。限额只作用在 `run` / `migrate` 复制对象正文的时候 |
-| `head bucket "…" on source` | 桶不存在、地址错，或密钥没有读权限 |
-| `create bucket … on target` | 目标密钥缺少 `s3:CreateBucket` |
-| 扫描很慢，加大 `--workers` 没用 | 正常。`scan` 是单线程。并发只作用在复制和 diff |
-| 大量 503 / 超时 | 减小 `workers`，大对象场景再减小 `multipart_concurrency` |
-| 大量 `etag mismatch` | 源端 SSE 或压缩会改 ETag。可把 `multipart_threshold` 调低改走分片（只校验 size），或人工抽查 |
-| `db_path is bound to bucket "X"` | 一个 db 只绑定一个桶，换路径 |
-| `database is locked` | 不要对同一个 db 起两个进程 |
-| 磁盘被临时文件写满 | 把 `spool_dir` 放到大磁盘，或减小 `workers` |
-| Ctrl-C 退不出 | 等当前请求结束，或再按一次（退出码 130） |
-| diff 还有 missing | 再 `migration migrate`，并看 `failed` 行的 `last_error` |
+| No overwrite of a target object | `HeadObject` before every write. A match is `done`. A mismatch is `conflict.log` and a skip |
+| No delete | No `DeleteObject`. A failed multipart upload is aborted only |
+| No cross-bucket mix-up | `HeadBucket`, a bucket-name check on each list page, and a bucket name stored in the SQLite file |
+| Source deletes during the run | A finished source 404 is `skipped`. Cancel and timeout are `failed` and will be retried |
+| Crash and cancel resume | Per-object state is in a SQLite WAL file. The first signal cancels workers; the next `migrate` continues |
+| Bounded memory | Small objects spool to disk. Large objects are read by part. The job queue is capped |
+| Check after copy | Size always. ETag as well for a single-part object when both ETags are comparable |
 
-退出码：`0` 成功（只迁一个桶时，复制阶段第一次 Ctrl-C 也是 0，没做完的对象留在 SQLite）；`1` 配置错误、远端错误、某桶失败、diff 发现缺口，或在扫描 / 多桶切换时被中断；`130` 第二次信号强制退出。
+Out of scope: version history, delete markers, Object Lock, bucket policies, lifecycle rules, two-way sync, and server-side `CopyObject` (the clusters are separate, so the bytes go through this process).
 
-更细的状态机、路径和排错见 [docs/使用手册.md](docs/使用手册.md)。设计约束见 [docs/DESIGN.md](docs/DESIGN.md)。
+## Troubleshooting
+
+| What you see | What to do |
+| --- | --- |
+| `read config … copy config.example.yaml first` | The `-c` path is missing. Copy `config.example.yaml` |
+| `old.endpoint is required` | Set `old.endpoint` or `OLD_ENDPOINT`. The target side reports `new.endpoint is required` the same way. Keys report `access_key` / `secret_key` |
+| `workers must be >= 1` | `--workers`, `WORKERS`, or YAML `workers` is below 1. YAML `0` means “default 16”. `0` on the CLI or in the environment is an error |
+| `multipart_concurrency must be >= 1` | Same rule, for part concurrency. YAML `0` means “default 4” |
+| `env WORKERS="…" is not an integer` | `WORKERS` must be a bare integer. Bandwidth belongs in `RATE_LIMIT=20M` |
+| `multipart_part_size must be >= 5242880` | Non-final parts must be at least 5 MiB. The default 16 MiB is already valid. The value is not raised automatically |
+| `unknown size suffix` or `rate limit` | `rate_limit`, `RATE_LIMIT`, or `--rate-limit` was not recognized. Decimal is `20M`. Binary is `20Mi` or `20MiB` |
+| `head bucket "…"` | The bucket is missing, the endpoint is wrong, or the key cannot read it. On the target, a create failure says `create bucket "…" on target (need s3:CreateBucket)` |
+| Source still busy at `20M` | `20M` is 20000000 bytes/s of source body reads. The upload is outside that cap. On a shared NIC, lower the number |
+| `scan` or `diff` did not slow down | Expected. The cap applies while `run` / `migrate` read object bodies |
+| Scan stays slow after raising `--workers` | Expected. `scan` is single-threaded. Concurrency starts at the copy, and at `diff` HEAD |
+| Many 503s or timeouts | Lower `workers`. For large objects, lower `multipart_concurrency` so `workers × multipart_concurrency` fits the proxy `maxconn` |
+| Many `etag mismatch` results | Source SSE or compression can change the ETag. Lower `multipart_threshold` to take the multipart path (size is checked, ETag is not compared), or sample the objects by hand |
+| `db_path is bound to bucket "…"` | That file already belongs to another bucket. Use a different `db_path` |
+| `database is locked` | Two processes are writing the same database. Use one process per file |
+| Disk fills with temp files | Move `spool_dir` to a large disk, or lower `workers` |
+| Ctrl-C does not return | Wait for the current request, or press it again (exit 130) |
+| `diff` still reports `missing` | Run `migrate` again and read `last_error` on `failed` rows |
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success. For a single bucket, the first Ctrl-C during the copy phase (`migrate`, or the copy half of `run`) also exits 0. Unfinished objects remain in SQLite |
+| 1 | Bad config, a remote error, a bucket failed, or `diff` found a missing or mismatched key. Also the first Ctrl-C during `scan`, and an interrupt while more than one bucket is in the run |
+| 130 | A second `SIGINT` or `SIGTERM`. The process exits immediately |
+
+Errors from the command are printed as `error: …` on stderr.
+
+## License
+
+Apache License 2.0. Copyright 2024-2026 RustFS, Inc.
