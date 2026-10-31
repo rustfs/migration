@@ -1,61 +1,30 @@
 # migration
 
-<p align="center">
-  <a href="https://github.com/rustfs/migration/blob/main/README.md">English</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_ZH.md">简体中文</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_DE.md">Deutsch</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_ES.md">Español</a> |
-  français |
-  <a href="https://github.com/rustfs/migration/blob/main/README_JA.md">日本語</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_KO.md">한국어</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_PT.md">Portuguese</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_RU.md">Русский</a>
-</p>
+[English](README.md) | [简体中文](README_ZH.md) | [Deutsch](README_DE.md) | [Español](README_ES.md) | **Français** | [日本語](README_JA.md) | [한국어](README_KO.md) | [Português](README_PT.md) | [Русский](README_RU.md)
 
-`migration` copie des objets dans un seul sens entre deux clusters compatibles S3. Il vise RustFS et MinIO auto-hébergés, ainsi que tout autre point de terminaison qui parle l'API S3. Les requêtes utilisent toujours l'adressage path-style, habituel sur ces clusters.
+`migration` copie la version courante des objets d’un cluster compatible S3 vers un autre. Vous pouvez ainsi transférer les données historiques d’un cluster RustFS ou MinIO pendant que les applications écrivent déjà sur le nouveau cluster. Dans la configuration, `old` désigne la source et `new` la destination. Les deux utilisent des URL S3 où le nom du bucket figure dans le chemin.
 
-On peut le lancer à côté du trafic en production. Trois règles valent pour chaque commande qui écrit :
+L’outil copie les clés manquantes, consigne les conflits dans `conflict.log` et enregistre sa progression dans une base SQLite locale. Il ne supprime aucun objet. La destination doit prendre en charge `If-None-Match: *` pour `PutObject` et `CompleteMultipartUpload`. Un objet créé par une application après la vérification initiale reste ainsi intact.
 
-- **Jamais d'écrasement.** Avant chaque écriture, l'outil appelle `HeadObject` sur la cible. Une correspondance est marquée terminée. Un objet différent est seulement journalisé et laissé tel quel.
-- **Jamais de suppression.** Il n'y a pas d'appel `DeleteObject`. Abandonner un envoi multipart ne retire que cet envoi inachevé, pas un objet déjà validé.
-- **Reprise possible.** Chaque objet a une ligne dans une base SQLite locale. Arrêter puis relancer ne refait pas le travail déjà terminé.
-
-Disposition courante : l'ancien cluster garde l'historique, le nouveau reçoit toutes les écritures, et l'application lit déjà les deux. Cet outil complète les clés que la cible n'a pas encore. Il ne remplace pas un objet plus récent sur la cible par des octets plus anciens venus de la source. Les conflits sur une même clé sont attendus dans cette disposition. Lire `conflict.log` et les traiter à la main.
-
-La copie emporte l'objet courant, ainsi que `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`, `Expires` et les métadonnées utilisateur `x-amz-meta-*`. L'historique des versions, les marqueurs de suppression, Object Lock, les politiques de bucket et les règles de cycle de vie restent en place.
-
-Dans le fichier de configuration, la source est `old` et la cible est `new`.
+La copie conserve le contenu courant de l’objet, les en-têtes `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language` et `Expires` ainsi que les métadonnées utilisateur `x-amz-meta-*`. L’historique des versions, les marqueurs de suppression, Object Lock, les politiques de bucket et les règles de cycle de vie restent hors du périmètre de la migration.
 
 ## Documentation
 
-| Guide | Contenu |
-| --- | --- |
-| Ce fichier | Installation, configuration, commandes, réglage et sécurité en français |
-| [README.md](README.md) | English, même structure |
-| [README_ZH.md](README_ZH.md) | 简体中文 |
-| [README_DE.md](README_DE.md) | Deutsch |
-| [README_JA.md](README_JA.md) | 日本語 |
-| [README_ES.md](README_ES.md) | Español |
-| [README_KO.md](README_KO.md) | 한국어 |
-| [README_PT.md](README_PT.md) | Portuguese |
-| [README_RU.md](README_RU.md) | Русский |
-| [docs/USAGE.md](docs/USAGE.md) | Court compagnon en anglais |
-| [docs/使用手册.md](docs/使用手册.md) | Manuel chinois plus détaillé |
-| [docs/DESIGN.md](docs/DESIGN.md) | Architecture et les contraintes que l'outil ne relâche pas |
-
-`migration --help` et `migration <commande> --help` affichent l'aide en anglais et en chinois.
+[Aide-mémoire en anglais](docs/USAGE.md) · [Manuel d’exploitation en chinois](docs/使用手册.md) · [Architecture en anglais](docs/DESIGN.md)
 
 ## Démarrage rapide
 
-Go 1.22 ou plus récent. SQLite est en Go pur : la compilation n'a pas besoin de CGO.
+Pour compiler le programme depuis le dépôt, utilisez Go 1.22 ou une version ultérieure. Après avoir copié le modèle, renseignez les adresses et les identifiants des deux clusters dans `config.yaml`.
 
 ```bash
 git clone https://github.com/rustfs/migration.git
 cd migration
-cp config.example.yaml config.yaml   # points de terminaison et clés, source et cible
 CGO_ENABLED=0 go build -o bin/migration .
 # ou : make build
+cp config.example.yaml config.yaml   # points de terminaison et clés, source et cible
+```
 
+```bash
 ./bin/migration list   -c config.yaml
 ./bin/migration run    -c config.yaml --workers 16 --rate-limit 20M
 ./bin/migration status -c config.yaml
@@ -64,17 +33,21 @@ CGO_ENABLED=0 go build -o bin/migration .
 
 Un `bucket:` vide migre chaque bucket de la source. `bucket: photos`, ou `--bucket photos`, n'en retient qu'un.
 
-`20M` est un mégaoctet décimal par seconde : 20×1000×1000 octets/s. Avant de l'augmenter sur un réseau partagé, lire [Limite de débit](#rate-limit).
+Utilisez `--bucket ""` pour sélectionner tous les buckets de la source, même si le fichier YAML ou `BUCKET` en désigne un seul.
+
+Avec `--rate-limit 20M`, le débit de lecture cumulé sur la source est limité à 20 000 000 octets par seconde. Les autres unités sont détaillées dans la section [Limite de débit](#rate-limit).
 
 ## Installation
 
+Dans [Build packages](https://github.com/rustfs/migration/actions/workflows/packages.yml), ouvrez une exécution réussie et choisissez votre plateforme sous **Artifacts**. Décompressez le téléchargement, vérifiez la somme SHA-256 de l’archive puis extrayez son contenu. Les archives Linux (amd64 et arm64) sont au format `.tar.gz`. Sous Windows (amd64), le fichier `.zip` contient `migration.exe`.
+
 ```bash
-git clone https://github.com/rustfs/migration.git
-cd migration
-CGO_ENABLED=0 go build -o bin/migration .
+./migration --version
 ```
 
-`make build` lance la même commande. Le résultat est le binaire statique `bin/migration`. `make test` lance `go test ./...`.
+```powershell
+.\migration.exe --version
+```
 
 Protéger `config.yaml` (`chmod 600` est un défaut raisonnable). Le processus journalise les points de terminaison et les clés d'objet. Il ne journalise pas les secrets.
 
@@ -84,7 +57,7 @@ Protéger `config.yaml` (`chmod 600` est un défaut raisonnable). Le processus j
 cp config.example.yaml config.yaml
 ```
 
-Le minimum est un point de terminaison, une access key et une secret key de chaque côté. La clé cible a besoin de `s3:CreateBucket` quand le bucket n'existe pas encore. Un bucket cible déjà présent n'est pas modifié.
+Indiquez l’adresse HTTP ou HTTPS et les identifiants de chaque cluster. Saisissez les identifiants dans les champs prévus à cet effet. L’URL ne doit contenir ni identifiants, ni paramètres de requête, ni fragment. La création d’un bucket sur la destination exige le droit `s3:CreateBucket`.
 
 ```yaml
 old:                              # source, lecture seule
@@ -149,7 +122,7 @@ Exemple : YAML `workers: 8`, environnement `WORKERS=32` et `--workers 4` ensembl
 
 Une concurrence ou une taille négative fait échouer le démarrage. `WORKERS` et `MULTIPART_CONCURRENCY` doivent être des entiers simples. Les suffixes de taille vont seulement sur `RATE_LIMIT` : `RATE_LIMIT=20M` est valide, `WORKERS=20M` ne l'est pas.
 
-`multipart_part_size` doit valoir au moins 5 MiB (5242880). S3 refuse une part non finale plus petite avec `EntityTooSmall`. Une valeur plus petite échoue au chargement de la configuration. Elle n'est pas relevée silencieusement. Si un objet dépasserait 10 000 parts, l'outil agrandit la taille de part de cet objet pour que l'envoi tienne.
+La valeur de `multipart_part_size` doit être comprise entre 5 Mio et 5 Gio (16 Mio par défaut). Tout objet de plus de 5 Gio est envoyé en plusieurs parties. Pour rester sous la limite de 10 000 parties, l’outil augmente leur taille si nécessaire. Le transfert échoue si la taille nécessaire dépasse 5 Gio par partie.
 
 Un nom de bucket ne doit contenir ni espace ni `/`.
 
@@ -201,7 +174,7 @@ Options communes à toutes les commandes :
 
 `status` affiche `BUCKET`, `TOTAL`, `PENDING`, `DONE`, `CONFLICT`, `SKIPPED` et `FAILED`. Sans bucket fixé, il lit les `migration-*.db` à côté de `db_path`, et la base configurée elle-même si ce fichier est déjà lié à un bucket. S'il n'y a encore rien, il le dit et sort avec 0. Lancer d'abord `scan` ou `run`.
 
-## Parcours
+## Procédures
 
 ### Migrer tous les buckets
 
@@ -215,10 +188,10 @@ Options communes à toutes les commandes :
 Pour chaque bucket, `run` fait ceci :
 
 1. `HeadBucket` sur la source.
-2. Créer le bucket sur la cible s'il manque. Un bucket existant n'est pas modifié.
-3. `ListObjectsV2` de la source vers SQLite. Cette étape est monothread.
-4. Démarrer `workers` goroutines de copie. Chaque objet est d'abord vérifié par `HeadObject` sur la cible. Une clé absente est lue sur la source et écrite sur la cible. Ces lectures partagent `rate_limit`. Une clé qui correspond déjà à l'inventaire est marquée `done` et n'est pas envoyée. Une clé présente mais différente est ajoutée au journal de conflits et n'est pas écrasée.
-5. Un objet à partir de `multipart_threshold` envoie ses parts avec `multipart_concurrency`. Ces parts partagent le même plafond d'octets.
+2. `ListObjectsV2` de la source vers SQLite. Cette étape est monothread.
+3. Créer le bucket sur la cible s'il manque. Un bucket existant n'est pas modifié.
+4. Lancer jusqu’à `workers` copies simultanées. Si une application crée la clé après la requête HEAD initiale, l’écriture conditionnelle protège cet objet. L’outil vérifie à nouveau la clé avant de lui attribuer l’état `done` ou `conflict`.
+5. À partir de `multipart_threshold`, chaque objet est transféré en plusieurs parties, dont `multipart_concurrency` au maximum en parallèle. Toutes les lectures partagent la même limite de débit.
 6. Vérifier la taille sur la cible. Un objet en une seule part est aussi vérifié par ETag quand les ETag sont comparables. Voir [État des objets](#resume-and-object-state).
 
 Les buckets sont copiés l'un après l'autre : `rate_limit` est donc le plafond de tout le processus.
@@ -252,13 +225,7 @@ Relancer `run` réunit ces deux étapes dans une commande.
 
 ## Concurrence
 
-Trois réglages, trois rôles :
-
-| Réglage | Ce qu'il limite | L'augmenter quand | Le baisser quand |
-| --- | --- | --- | --- |
-| `workers` / `--workers` | Combien d'**objets** sont en vol. Aussi le parallélisme HEAD de `diff` | Surtout de petits objets, et le CPU, le disque et le proxy ont encore de la marge | Des 503, des timeouts, un disque source saturé, ou un objet isolé à examiner (`--workers 1`) |
-| `multipart_concurrency` / `--multipart-concurrency` | Combien de **parts d'un gros objet** partent ensemble | Un seul objet est gros et ce flux peut encore utiliser le lien | Les gros objets remplissent déjà le lien, ou plusieurs ensemble remplissent le proxy |
-| `rate_limit` / `--rate-limit` | Combien d'**octets source par seconde** tous ces workers peuvent lire, ensemble | La source et le réseau ont encore de la marge | La production utilise le cluster source ou la même carte réseau. Commencer à `20M`, puis essayer `30M` ou `50M` |
+`workers` règle le nombre d’objets copiés simultanément. Pour les gros objets, `multipart_concurrency` fixe aussi le nombre de parties transférées en parallèle par objet. Avec les valeurs par défaut (16 objets et quatre parties), un cluster peut recevoir environ 64 requêtes simultanées. Tenez compte des disques, du proxy et de la mémoire disponible avant d’augmenter ces valeurs.
 
 `scan` ignore `workers` et `rate_limit`. Le listage avance page par page : chaque page a besoin du jeton de continuation de la précédente, et les lignes vont dans un seul fichier SQLite. Un scan lent ne s'accélère pas avec `--workers`. `list`, `diff` et `status` ne lisent pas les corps d'objet, le plafond d'octets ne s'applique pas. `diff` utilise `--workers` pour les HEAD.
 
@@ -270,9 +237,7 @@ workers = 4 objets à la fois
   objet D (gros)   ── la même chose
 ```
 
-Le pic de requêtes en vol vers un cluster est d'environ `workers × multipart_concurrency`. Un petit objet utilise une requête. Un objet au seuil multipart multiplie par la concurrence des parts. Le défaut `16 × 4` vaut 64. Le `maxconn` de HAProxy ou de Nginx, et les disques des deux clusters, doivent porter ce produit.
-
-Le client HTTP relève les connexions inactives par hôte jusqu'à ce produit (plafonné à 1024), au lieu des deux connexions inactives par hôte du défaut Go. C'est de la réutilisation. Le travail en vol est borné par le pool de workers et le sémaphore des parts. La file d'attente tient au plus 2048 descripteurs d'objet : un grand `--workers` ne charge pas tout le bucket en mémoire.
+Chaque partie en cours de transfert est mise en mémoire. La file d’attente contient au plus 2 048 descripteurs d’objet. Le client HTTP peut réutiliser ses connexions et en conserve jusqu’à 1 024 inactives par hôte.
 
 Points de départ :
 
@@ -289,7 +254,7 @@ Points de départ :
 
 Pendant une copie, une ligne de progression est journalisée environ toutes les 10 secondes : processed, copied, conflicts, skipped, failed et bytes.
 
-Chaque petit objet en vol a un fichier temporaire dans `spool_dir`, jusqu'à environ `multipart_threshold` octets, parce que `PutObject` a besoin d'un corps seekable. Si `/tmp` est un disque mémoire, pointer `spool_dir` vers un vrai disque. Plus de workers, plus de ces fichiers en même temps.
+Chaque petit objet en vol a un fichier temporaire dans `spool_dir`, jusqu'à environ `multipart_threshold` octets, parce que `PutObject` a besoin d'un flux repositionnable. Si `/tmp` est un disque mémoire, pointer `spool_dir` vers un vrai disque. Plus de workers, plus de ces fichiers en même temps.
 
 Un processus par fichier de base. SQLite s'ouvre en mode WAL avec une seule connexion dans le processus : les mises à jour d'état restent sérialisées, les octets d'objet restent sur le pool de workers. Un second processus sur le même fichier signale encore `database is locked`.
 
@@ -297,13 +262,9 @@ Un processus par fichier de base. SQLite s'ouvre en mode WAL avec une seule conn
 
 ## Limite de débit
 
-`rate_limit` est un seul seau de jetons partagé par chaque worker de copie, y compris les parts d'un gros objet. Il compte les octets lus dans les corps d'objet de la source. List, HEAD et le contrôle de conflit avant écriture sont hors plafond. L'envoi qui suit une lecture terminée n'est pas compté une seconde fois.
+`rate_limit` plafonne le débit cumulé des lectures sur la source, toutes copies et parties confondues. Les requêtes de liste, les lectures d’en-têtes et les envois vers la cible ne sont pas comptabilisés.
 
-Un petit objet est lu sur la source au plafond, puis écrit sur la cible. Les lectures source restent dans le plafond. L'écriture qui suit peut être brièvement plus rapide. Si l'hôte de migration partage une carte réseau avec la production, cette écriture consomme encore de la bande passante. Pour garder l'usage total de la carte autour de 40 Mo/s, commencer à `20M`.
-
-Le plafond ralentit les copies. Il n'écrase pas et il ne supprime pas. Un objet qui correspond déjà à l'inventaire est toujours sauté. Le premier Ctrl-C annule une lecture qui attend des jetons. L'objet inachevé reste dans SQLite pour le prochain `migrate`.
-
-Le plafond ne réduit pas le nombre de requêtes en vol. Un proxy qui renvoie 503 reste un problème de concurrence : baisser `workers`, puis `multipart_concurrency`.
+Les petits objets sont d’abord enregistrés sur le disque local, puis envoyés à la destination. Si les deux transferts empruntent la même interface réseau, prévoyez aussi de la bande passante pour l’envoi.
 
 ### Unités
 
@@ -341,7 +302,7 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 
 Le premier Ctrl-C ou `SIGTERM` annule le pool de workers. Les objets pas encore commencés restent `pending`. Un envoi multipart en cours est abandonné : cela libère seulement cet envoi et ne supprime pas un objet validé. L'état déjà écrit dans SQLite est conservé. Un second signal quitte immédiatement avec le code 130.
 
-Si le `PutObject` cible a réussi et que la ligne n'est pas encore marquée `done`, la ligne reste `failed` (ou `pending`) alors que l'objet est déjà sur la cible. Le `migrate` suivant vérifie la cible avec `HeadObject`. Quand la taille correspond et qu'un ETag comparable correspond, la ligne passe à `done`. Quand la taille diffère, ou qu'un ETag comparable diffère, la ligne passe à `conflict`, et l'objet n'est toujours pas écrasé.
+Si l’ETag de la source change entre l’inventaire et le transfert, la copie échoue. Actualisez l’inventaire avec `scan` avant de relancer `migrate`, ou relancez simplement `run`.
 
 Une requête annulée, une échéance et `request canceled` sont `failed`, même si le texte d'erreur contient aussi `NotFound` ou `StatusCode: 404`. Un abandon multipart signale souvent `NoSuchUpload`. Ce n'est pas un objet source manquant. `skipped` signifie que la requête source s'est terminée et que l'objet avait vraiment disparu.
 
@@ -359,7 +320,7 @@ Une requête annulée, une échéance et `request canceled` sont `failed`, même
 | `done` | Copié et vérifié, ou la cible correspondait déjà à l'inventaire | Inchangé |
 | `conflict` | La cible a la clé et elle ne correspond pas à l'inventaire. Pas d'écrasement | Inchangé |
 
-**Règle de correspondance.** La taille doit égaler la taille inventoriée. Les ETag ne sont comparés que si les deux côtés en ont un et qu'aucun n'est un ETag multipart (une valeur contenant `-`, de la forme `hash-N`). Les ETag multipart dépendent des frontières de parts : ils ne sont pas comparés, la taille est le contrôle. Une taille différente, ou un ETag comparable différent, est un conflit.
+Si la clé existe déjà, l’objet ne passe à l’état `done` que si sa taille correspond et que les deux ETag sont renseignés et identiques. Sinon, il passe à l’état `conflict` et reste intact. Un même contenu peut avoir deux ETag différents si le découpage en parties diffère. En cas d’interruption juste après un transfert, vérifiez ces conflits manuellement.
 
 Chaque conflit est une ligne TSV dans le journal, horodatages RFC3339 UTC :
 
@@ -367,16 +328,18 @@ Chaque conflit est une ligne TSV dans le journal, horodatages RFC3339 UTC :
 <object-key>	<source-LastModified>	<target-LastModified>
 ```
 
+Les clés qui contiennent des caractères de contrôle ou commencent par un guillemet double sont écrites entre guillemets, avec les séquences d’échappement de Go.
+
 Un seul bucket configuré utilise `db_path` et `conflict_log` tels qu'écrits. Le mode tous les buckets dérive des fichiers voisins :
 
 - `migration-<bucket>.db`
 - `conflict-<bucket>.log`
 
-Un fichier de base est lié à un bucket. Le pointer vers un autre bucket échoue avec `db_path is bound to bucket "…"`.
+`migrate` nécessite un inventaire créé par `scan` ou `run`. La base est associée au bucket et aux points de terminaison. Avant de réutiliser une ancienne base, vérifiez qu’elle correspond aux bons clusters. La première analyse enregistre la source et la première migration enregistre la destination. Si l’analyse échoue ou est interrompue, relancez `scan` ou `run` avant d’utiliser `migrate`. Les anciennes bases ne conservent aucune trace de fin d’analyse. En cas de doute, relancez l’analyse.
 
 ## Vérifier la cible avec diff
 
-`diff` liste le bucket source en direct et fait un `HEAD` de chaque clé sur la cible. Il ne lit pas l'inventaire SQLite de la migration et il n'envoie rien.
+`diff` vérifie les tailles et les ETag comparables sans télécharger les objets. Parmi les objets comptés dans `ok`, `size_only` indique ceux dont seule la taille a été vérifiée. Avec `--extra`, un index temporaire sert à repérer les clés présentes uniquement sur la destination. Si le bucket source est vide, `diff` vérifie que le bucket de destination existe et renvoie le code 1 s’il est absent.
 
 ```bash
 ./bin/migration diff -c config.yaml --workers 32
@@ -385,8 +348,8 @@ Un fichier de base est lié à un bucket. Le pointer vers un autre bucket échou
 
 ```text
 === diff photos ===
-ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
-一致=1000  缺失=2  大小不一致=0  ETag不一致=1  仅目标有=0
+ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0  size_only=3
+一致=1000  缺失=2  大小不一致=0  ETag不一致=1  仅目标有=0  仅比大小=3
   missing  a.txt  not on target
   etag     b.txt  src=abc dst=def
 ```
@@ -395,7 +358,7 @@ La deuxième ligne de synthèse répète les compteurs en chinois, parce que la 
 
 | Résultat | Sens |
 | --- | --- |
-| `missing` | Sur la source, pas sur la cible. Relancer `migrate` ou `run` |
+| `missing` | Clé présente sur la source et absente de la destination |
 | `size` / `etag` | Même clé, contenus différents. Souvent une écriture déjà faite sur la cible. Cet outil ne l'écrase pas |
 | `extra` | Seulement sur la cible. Signalé avec `--extra`. En général une écriture déjà arrivée sur le nouveau cluster. Pas un échec |
 
@@ -405,7 +368,7 @@ Le code de sortie est 1 si une clé manque ou si la taille ou l'ETag ne correspo
 
 | Garantie | Moyen |
 | --- | --- |
-| Pas d'écrasement d'un objet cible | `HeadObject` avant chaque écriture. Une correspondance est `done`. Un écart va dans `conflict.log` et la clé est sautée |
+| Pas d'écrasement d'un objet cible | `HeadObject` → `PutObject` / `CompleteMultipartUpload` (`If-None-Match: *`) |
 | Pas de suppression | Pas de `DeleteObject`. Un envoi multipart en échec est seulement abandonné |
 | Pas de mélange de buckets | `HeadBucket`, un contrôle du nom de bucket sur chaque page de liste, et un nom de bucket stocké dans le fichier SQLite |
 | Suppressions côté source pendant le passage | Un 404 source terminé est `skipped`. Annulation et délai sont `failed` et seront repris |
@@ -423,7 +386,7 @@ Hors périmètre : historique des versions, marqueurs de suppression, Object Loc
 | `old.endpoint is required` | Renseigner `old.endpoint` ou `OLD_ENDPOINT`. Le côté cible signale de la même façon `new.endpoint is required`. Les clés signalent `access_key` / `secret_key` |
 | `workers must be >= 1` | `--workers`, `WORKERS` ou le `workers` du YAML est inférieur à 1. Un `0` dans le YAML veut dire « défaut 16 ». Un `0` en ligne de commande ou dans l'environnement est une erreur |
 | `multipart_concurrency must be >= 1` | Même règle pour la concurrence des parts. Un `0` dans le YAML veut dire « défaut 4 » |
-| `env WORKERS="…" is not an integer` | `WORKERS` doit être un entier nu. Le débit va dans `RATE_LIMIT=20M` |
+| `env WORKERS="…" is not an integer` | `WORKERS` doit être un entier sans unité. Le débit va dans `RATE_LIMIT=20M` |
 | `multipart_part_size must be >= 5242880` | Les parts non finales doivent faire au moins 5 MiB. Le défaut de 16 MiB est déjà valide. La valeur n'est pas relevée automatiquement |
 | `unknown size suffix` ou `rate limit` | `rate_limit`, `RATE_LIMIT` ou `--rate-limit` n'a pas été reconnu. Le décimal est `20M`. Le binaire est `20Mi` ou `20MiB` |
 | `head bucket "…"` | Le bucket manque, le point de terminaison est faux, ou la clé ne peut pas lire. Un échec de création sur la cible dit `create bucket "…" on target (need s3:CreateBucket)` |
@@ -431,19 +394,19 @@ Hors périmètre : historique des versions, marqueurs de suppression, Object Loc
 | `scan` ou `diff` n'a pas ralenti | Attendu. Le plafond s'applique pendant que `run` / `migrate` lisent les corps d'objet |
 | Le scan reste lent après avoir augmenté `--workers` | Attendu. `scan` est monothread. La concurrence commence à la copie, et au HEAD de `diff` |
 | Beaucoup de 503 ou de timeouts | Baisser `workers`. Pour les gros objets, baisser `multipart_concurrency` afin que `workers × multipart_concurrency` tienne dans le `maxconn` du proxy |
-| Beaucoup de résultats `etag mismatch` | Un SSE ou une compression côté source peut changer l'ETag. Baisser `multipart_threshold` pour prendre le chemin multipart (la taille est vérifiée, l'ETag ne l'est pas), ou échantillonner les objets à la main |
+| Beaucoup de résultats `etag mismatch` | Vérifiez séparément le contenu de l’objet. Le découpage en parties et le chiffrement côté serveur peuvent influer sur les ETag. |
 | `db_path is bound to bucket "…"` | Ce fichier appartient déjà à un autre bucket. Utiliser un autre `db_path` |
 | `database is locked` | Deux processus écrivent la même base. Un processus par fichier |
 | Le disque se remplit de fichiers temporaires | Déplacer `spool_dir` vers un grand disque, ou baisser `workers` |
 | Ctrl-C ne revient pas | Attendre la requête en cours, ou appuyer encore (sortie 130) |
-| `diff` signale encore `missing` | Relancer `migrate` et lire `last_error` des lignes `failed` |
+| `diff` signale encore `missing` | Pour une ligne `failed`, consultez `last_error` avant de réessayer. Pour une ligne `done` ou `conflict`, créez un nouvel inventaire dans un autre répertoire. En mode multibucket, changer le seul nom de fichier de la base ne suffit pas. |
 
 ## Codes de sortie
 
 | Code | Sens |
 | --- | --- |
-| 0 | Succès. Pour un seul bucket, le premier Ctrl-C pendant la copie (`migrate`, ou la moitié copie de `run`) sort aussi avec 0. Les objets inachevés restent dans SQLite |
-| 1 | Configuration invalide, erreur distante, un bucket en échec, ou `diff` a trouvé une clé manquante ou différente. Aussi le premier Ctrl-C pendant `scan`, et une interruption alors que plus d'un bucket est dans le passage |
+| 0 | Opération terminée. Les conflits et les objets ignorés sont comptés séparément. |
+| 1 | Configuration incorrecte, interruption, échec d’une opération ou d’une copie, ou clé manquante ou différente signalée par `diff`. |
 | 130 | Un second `SIGINT` ou `SIGTERM`. Le processus quitte immédiatement |
 
 Les erreurs de commande s'affichent sur stderr sous la forme `error: …`.

@@ -2,10 +2,12 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -57,7 +59,8 @@ type Config struct {
 // per-object adjustment that keeps an upload under 10 000 parts only grows
 // an already-valid part size, so it is not a reason to silently raise a
 // value the operator chose.
-const MinMultipartPartSize int64 = 5 * 1024 * 1024
+const MinMultipartPartSize int64 = 5 << 20
+const MaxMultipartPartSize int64 = 5 << 30
 
 // Load parses YAML, applies env overrides and defaults. It does not require
 // every field: each command validates what it needs.
@@ -215,12 +218,24 @@ func (c *Config) validateMultipartPartSize() error {
 	if c.MultipartPartSize < MinMultipartPartSize {
 		return fmt.Errorf("multipart_part_size must be >= %d (5 MiB): non-final S3 parts smaller than that are rejected with EntityTooSmall (got %d)", MinMultipartPartSize, c.MultipartPartSize)
 	}
+	if c.MultipartPartSize > MaxMultipartPartSize {
+		return fmt.Errorf("multipart_part_size must be <= %d (5 GiB), got %d", MaxMultipartPartSize, c.MultipartPartSize)
+	}
 	return nil
 }
 
 func (c *Config) ValidateNames() error {
-	if c.Bucket != "" && strings.ContainsAny(c.Bucket, " \t/") {
-		return fmt.Errorf("bucket %q must not contain whitespace or '/'", c.Bucket)
+	if c.Bucket == "" {
+		return nil
+	}
+	return ValidateBucketName(c.Bucket)
+}
+
+// ValidateBucketName also protects per-bucket filenames derived from a remote listing.
+func ValidateBucketName(bucket string) error {
+	if bucket == "" || bucket == "." || bucket == ".." || strings.ContainsAny(bucket, `/\:<>|"?*`) ||
+		strings.IndexFunc(bucket, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return fmt.Errorf("invalid bucket name %q", bucket)
 	}
 	return nil
 }
@@ -228,6 +243,16 @@ func (c *Config) ValidateNames() error {
 // AllBuckets reports whether the operator pinned no bucket (whole instance).
 func (c *Config) AllBuckets() bool {
 	return c.Bucket == ""
+}
+
+func validateEndpoint(label, endpoint string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" ||
+		u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		// Avoid echoing URLs that may include embedded credentials or signatures.
+		return fmt.Errorf("%s.endpoint must be an HTTP(S) URL with a host and no credentials, query or fragment", label)
+	}
+	return nil
 }
 
 // ValidateSource is required by list / scan.
@@ -238,7 +263,7 @@ func (c *Config) ValidateSource() error {
 	if c.Old.AccessKey == "" || c.Old.SecretKey == "" {
 		return fmt.Errorf("old.access_key and old.secret_key are required")
 	}
-	return nil
+	return validateEndpoint("old", c.Old.Endpoint)
 }
 
 // ValidatePair is required by run / migrate / diff.
@@ -252,7 +277,7 @@ func (c *Config) ValidatePair() error {
 	if c.New.AccessKey == "" || c.New.SecretKey == "" {
 		return fmt.Errorf("new.access_key and new.secret_key are required")
 	}
-	return nil
+	return validateEndpoint("new", c.New.Endpoint)
 }
 
 // ValidateConcurrency checks the knobs that size the worker pool and the
@@ -339,19 +364,15 @@ func JobBuffer(workers int) int {
 	if workers < 1 {
 		workers = 1
 	}
-	n := workers * 2
-	if n > 2048 {
+	if workers >= 1024 {
 		return 2048
 	}
-	return n
+	return workers * 2
 }
 
 // ApplyBucketFlag overrides YAML/env when --bucket is passed.
 func (c *Config) ApplyBucketFlag(flag string) {
-	flag = strings.TrimSpace(flag)
-	if flag != "" {
-		c.Bucket = flag
-	}
+	c.Bucket = strings.TrimSpace(flag)
 }
 
 // DBPathFor returns the state DB for one bucket. Single-bucket mode uses

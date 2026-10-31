@@ -77,14 +77,16 @@ rate_limit: 0
 		t.Fatalf("list exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
 
-	// A pinned bucket makes status open (and create) that db before any scan.
+	// Reading status before the first scan must not create an inventory.
 	stdout, stderr, code = runBin(t, bin, "status", "-c", cfgPath)
 	if code != 0 {
 		t.Fatalf("status before scan exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
-	fields := statusRow(t, stdout)
-	if fields[1] != "0" || fields[3] != "0" {
-		t.Fatalf("status before scan: %q", fields)
+	if !strings.Contains(stdout, "no state DBs") {
+		t.Fatalf("status before scan: %s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "migration.db")); !os.IsNotExist(err) {
+		t.Fatalf("status created a database, stat err=%v", err)
 	}
 
 	if _, stderr, code = runBin(t, bin, "scan", "-c", cfgPath); code != 0 {
@@ -94,7 +96,7 @@ rate_limit: 0
 	if code != 0 {
 		t.Fatalf("status after scan exit %d\n%s\n%s", code, stdout, stderr)
 	}
-	fields = statusRow(t, stdout)
+	fields := statusRow(t, stdout)
 	if fields[1] != "2" || fields[2] != "2" || fields[3] != "0" {
 		t.Fatalf("status after scan: %q", fields)
 	}

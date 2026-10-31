@@ -5,10 +5,12 @@ const Version = "0.2.0"
 const rootShort = `Safe one-way S3 migration / 安全的单向 S3 迁移`
 
 const rootLong = `migration copies objects from a source S3-compatible cluster to a target.
-Never overwrites. Never deletes. Resume after Ctrl-C via local SQLite.
+Never overwrites on targets that support If-None-Match for PUT and multipart completion.
+Never deletes objects. Resume after Ctrl-C via local SQLite.
 
 migration 把对象从来源 S3 兼容集群复制到目标集群。
-永不覆盖、永不删除；用本地 SQLite 记录进度，Ctrl-C 后续跑即可。
+目标须支持普通上传和完成分片上传时的条件写入，以保证永不覆盖。
+迁移不会删除对象。进度保存在本地 SQLite 中，按 Ctrl-C 停止后可继续。
 
 Quick start / 快速开始:
   1. cp config.example.yaml config.yaml
@@ -79,7 +81,7 @@ Re-running scan picks up new keys and retries skipped/failed rows.
 Does not write to the target.
 
 对来源做 ListObjectsV2，把 {key,size,mtime,etag} 写入本地 SQLite。
-再次扫描会收录新对象，并让 previously skipped/failed 的行重新进入 pending。
+再次扫描会收录新对象，并将之前跳过或失败的对象重新标记为 pending。
 不会对目标写入。
 
 Scan is single-threaded. --workers does not speed up listing.
@@ -89,14 +91,12 @@ Example:
   migration scan -c config.yaml`
 
 const migrateShort = `Copy pending objects (never overwrites) / 复制待迁移对象（永不覆盖）`
-const migrateLong = `Copy every SQLite row in pending/failed. If the key already exists on
-the target and matches the inventoried size (and single-part ETag, when both
-sides have one), it is marked done. A different object is logged to
-conflict.log and left untouched.
+const migrateLong = `Copy pending/failed rows from a completed scan. Existing keys are marked done
+only if the size and a nonempty ETag both match. All other existing keys are
+logged as conflicts. A failed copy or an interrupted run exits nonzero.
 
-复制 SQLite 中 pending/failed 的对象。目标已有同名 key 且与清单大小一致
-（两边都有非分片 ETag 时 ETag 也须一致）则记为 done。不一致则写入
-conflict.log，不覆盖。
+复制已扫描清单中待处理或失败的对象。目标上已有同名对象时，只有大小和非空 ETag
+均相同才记为 done，否则记入冲突日志。复制失败或运行中断时，命令以非零状态退出。
 
 --workers is the object pool. --multipart-concurrency is per large object.
 --rate-limit is the shared source-read cap across that pool (0 = unlimited).
@@ -116,10 +116,11 @@ Example:
 
 const diffShort = `Compare source vs target / 对比源与目标`
 const diffLong = `List the source and HEAD each key on the target. Reports missing objects
-and size/ETag mismatches. Exit code 1 if the source is not fully present.
+and size/ETag mismatches. size_only counts keys compared by size alone.
+Exit code 1 for missing keys, mismatches or errors.
 
 列出源对象并对目标做 HEAD：报告缺失、大小/ETag 不一致。
-源数据未完整出现在目标上时退出码为 1。
+size_only 表示仅通过大小检查的对象数。缺失、不匹配或出错时退出码为 1。
 
 --workers controls parallel HEAD requests. It does not upload anything.
 --workers 控制并行 HEAD 的数量，diff 不会上传对象。

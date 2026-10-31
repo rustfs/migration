@@ -3,9 +3,12 @@ package cmd
 import (
 	"bytes"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -147,7 +150,7 @@ func TestCLIMigrateMultipartAndCleanDiff(t *testing.T) {
 	defer oldS3.Close()
 	newS3 := fakes3.New(t)
 	defer newS3.Close()
-	newS3.SetPartDelay(40 * time.Millisecond)
+	newS3.RequireConcurrentParts(2)
 
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
@@ -239,5 +242,110 @@ func assertNoUnsafeCalls(t *testing.T, oldS3, newS3 *fakes3.Server) {
 	if oldS3.DeleteObjectCalls() != 0 || newS3.DeleteObjectCalls() != 0 || oldS3.CopyObjectCalls() != 0 || newS3.CopyObjectCalls() != 0 {
 		t.Fatalf("unsafe API calls: oldDelete=%d newDelete=%d oldCopy=%d newCopy=%d",
 			oldS3.DeleteObjectCalls(), newS3.DeleteObjectCalls(), oldS3.CopyObjectCalls(), newS3.CopyObjectCalls())
+	}
+}
+
+func TestMigrateRequiresCompletedScanAndRejectsNewTarget(t *testing.T) {
+	source := fakes3.New(t)
+	defer source.Close()
+	target := fakes3.New(t)
+	defer target.Close()
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "inventory.db")
+	configure := func(dst string) {
+		writeClusterConfig(t, cfg, source.URL, dst, dbPath, filepath.Join(dir, "conflict.log"), dir, "bucket: photos\n")
+	}
+	configure(target.URL)
+	if _, err := execRoot(t, "migrate", "-c", cfg); err == nil {
+		t.Fatal("migrate succeeded without a scan")
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("missing inventory was created: stat=%v", err)
+	}
+	if _, err := execRoot(t, "scan", "-c", cfg); err == nil {
+		t.Fatal("scan of nonexistent source bucket succeeded")
+	}
+	source.Put("photos", "k", []byte("data"), time.Now(), fakes3.Metadata{})
+	if _, err := execRoot(t, "migrate", "-c", cfg); err == nil {
+		t.Fatal("migrate accepted an incomplete scan")
+	}
+	if _, err := execRoot(t, "run", "-c", cfg); err != nil {
+		t.Fatalf("run after failed scan: %v", err)
+	}
+
+	replacement := fakes3.New(t)
+	defer replacement.Close()
+	configure(replacement.URL)
+	if _, err := execRoot(t, "migrate", "-c", cfg); err == nil {
+		t.Fatal("migrate silently reused terminal rows for another target")
+	}
+	resp, err := http.Head(replacement.URL + "/photos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("target bucket created before state validation: %s", resp.Status)
+	}
+}
+
+func TestStatusReportsInvalidStateFile(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.yaml")
+	path := filepath.Join(dir, "migration-photos.db")
+	if err := os.WriteFile(path, []byte("unrelated file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeClusterConfig(t, cfg, "", "", filepath.Join(dir, "migration.db"), filepath.Join(dir, "conflict.log"), dir, "")
+	if _, err := execRoot(t, "status", "-c", cfg); err == nil {
+		t.Fatal("status silently accepted corrupt inventory")
+	}
+}
+
+func TestFailedRescanBlocksCopyAndBadTargetCanBeCorrected(t *testing.T) {
+	src := fakes3.NewWithObjects(t, "photos", map[string][]byte{"data": []byte("ok")}, time.Now())
+	defer src.Close()
+	dst := fakes3.New(t)
+	defer dst.Close()
+	var denyList atomic.Bool
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if denyList.Load() && r.URL.Query().Has("list-type") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		src.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer source.Close()
+	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer denied.Close()
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.yaml")
+	configure := func(target string) {
+		writeClusterConfig(t, cfg, source.URL, target, filepath.Join(dir, "state.db"), filepath.Join(dir, "conflict.log"), dir, "bucket: photos\n")
+	}
+	configure(denied.URL)
+	if _, err := execRoot(t, "scan", "-c", cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execRoot(t, "migrate", "-c", cfg); err == nil {
+		t.Fatal("inaccessible target reported success")
+	}
+	configure(dst.URL)
+	denyList.Store(true)
+	if _, err := execRoot(t, "scan", "-c", cfg); err == nil {
+		t.Fatal("injected listing failure reported success")
+	}
+	if _, err := execRoot(t, "migrate", "-c", cfg); err == nil {
+		t.Fatal("failed rescan left inventory usable")
+	}
+	denyList.Store(false)
+	if _, err := execRoot(t, "run", "-c", cfg); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := dst.Object("photos", "data"); string(data) != "ok" {
+		t.Fatalf("corrected migration copied %q", data)
 	}
 }

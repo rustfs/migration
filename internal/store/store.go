@@ -3,8 +3,10 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -39,11 +41,10 @@ func Open(path, bucket string) (*Store, error) {
 			return nil, fmt.Errorf("create db dir %s: %w", dir, err)
 		}
 	}
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)")
+	db, err := openDB(path, "rwc")
 	if err != nil {
 		return nil, err
 	}
-	tuneSQLite(db)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
@@ -56,21 +57,93 @@ func Open(path, bucket string) (*Store, error) {
 }
 
 func ensureBucket(db *sql.DB, bucket string) error {
-	var existing string
-	err := db.QueryRow(`SELECT value FROM meta WHERE key = 'bucket'`).Scan(&existing)
-	switch {
-	case err == sql.ErrNoRows:
-		_, err := db.Exec(`INSERT INTO meta(key, value) VALUES('bucket', ?)`, bucket)
+	tx, err := db.Begin()
+	if err != nil {
 		return err
-	case err != nil:
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO meta(key,value) VALUES('bucket',?) ON CONFLICT(key) DO NOTHING`, bucket)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 1 {
+		if _, err := tx.Exec(`INSERT INTO meta(key,value) VALUES('scan_complete', '0')`); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return checkBucket(db, bucket)
+}
+
+func checkBucket(db *sql.DB, bucket string) error {
+	var existing string
+	if err := db.QueryRow(`SELECT value FROM meta WHERE key='bucket'`).Scan(&existing); err != nil {
 		return fmt.Errorf("read bucket meta: %w", err)
-	case existing != bucket:
+	}
+	if existing != bucket {
 		return fmt.Errorf("db_path is bound to bucket %q but config requests %q; use a separate db_path per bucket", existing, bucket)
 	}
 	return nil
 }
 
+// BindEndpoints prevents terminal rows from one migration being reused for
+// another. A scan only knows the source. Existing pre-binding databases adopt
+// their configured endpoint on first use without discarding completed work.
+func (s *Store) BindEndpoints(source, target string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, entry := range []struct{ key, value string }{{"source_endpoint", source}, {"target_endpoint", target}} {
+		if entry.value == "" {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING`, entry.key, entry.value); err != nil {
+			return err
+		}
+		var bound string
+		if err := tx.QueryRow(`SELECT value FROM meta WHERE key=?`, entry.key).Scan(&bound); err != nil {
+			return err
+		}
+		if bound != entry.value {
+			return fmt.Errorf("db_path is bound to %s %q, configured %q; use a separate db_path for this migration", entry.key, bound, entry.value)
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) Close() error { return s.db.Close() }
+
+func openDB(path, mode string) (*sql.DB, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	// SQLite file URIs require a leading slash before Windows drive letters.
+	name := filepath.ToSlash(abs)
+	if !strings.HasPrefix(name, "/") {
+		name = "/" + name
+	}
+	query := url.Values{"mode": {mode}, "_pragma": {"busy_timeout(5000)"}}
+	if mode != "ro" {
+		query.Add("_pragma", "journal_mode(WAL)")
+		query.Add("_pragma", "synchronous(NORMAL)")
+	}
+	uri := url.URL{Scheme: "file", Path: name, RawQuery: query.Encode()}
+	db, err := sql.Open("sqlite", uri.String())
+	if err != nil {
+		return nil, err
+	}
+	tuneSQLite(db)
+	return db, nil
+}
 
 // tuneSQLite keeps a single connection. WAL still allows a writer plus
 // readers, but database/sql would otherwise open one connection per worker.
@@ -82,19 +155,46 @@ func tuneSQLite(db *sql.DB) {
 	db.SetMaxIdleConns(1)
 }
 
-// OpenExisting opens a state DB without rebinding it to a bucket.
+// OpenExisting opens a state database read-only for status.
 func OpenExisting(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err := openDB(path, "ro")
 	if err != nil {
 		return nil, err
 	}
-	tuneSQLite(db)
 	s := &Store{db: db}
 	if _, err := s.BoundBucket(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("open existing %s: %w", path, err)
 	}
 	return s, nil
+}
+
+// OpenInventory requires a state DB created by scan, and never creates one.
+func OpenInventory(path, bucket string) (*Store, error) {
+	db, err := openDB(path, "rw")
+	if err != nil {
+		return nil, err
+	}
+	if err := checkBucket(db, bucket); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open inventory %s (run scan first): %w", path, err)
+	}
+	var incomplete bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM meta WHERE key='scan_complete' AND value != '1')`).Scan(&incomplete); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if incomplete {
+		db.Close()
+		return nil, fmt.Errorf("inventory %s is incomplete; run scan again", path)
+	}
+	return &Store{db: db}, nil
+}
+
+// SetScanComplete leaves the last scan marked incomplete until all pages are durable.
+func (s *Store) SetScanComplete(complete bool) error {
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO meta(key,value) VALUES('scan_complete',?)`, complete)
+	return err
 }
 
 func (s *Store) BoundBucket() (string, error) {

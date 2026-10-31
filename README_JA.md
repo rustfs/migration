@@ -1,61 +1,30 @@
 # migration
 
-<p align="center">
-  <a href="https://github.com/rustfs/migration/blob/main/README.md">English</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_ZH.md">简体中文</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_DE.md">Deutsch</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_ES.md">Español</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_FR.md">français</a> |
-  日本語 |
-  <a href="https://github.com/rustfs/migration/blob/main/README_KO.md">한국어</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_PT.md">Portuguese</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_RU.md">Русский</a>
-</p>
+[English](README.md) | [简体中文](README_ZH.md) | [Deutsch](README_DE.md) | [Español](README_ES.md) | [Français](README_FR.md) | **日本語** | [한국어](README_KO.md) | [Português](README_PT.md) | [Русский](README_RU.md)
 
-`migration` は、S3 互換クラスタの間でオブジェクトを一方向にコピーします。対象は自前で運用する RustFS と MinIO、および S3 API を話すその他のエンドポイントです。リクエストは常に path-style です。この種のクラスタではそれが通常の呼び方です。
+`migration` は、S3 互換クラスター間でオブジェクトの現行バージョンをコピーするツールです。たとえば、アプリケーションの書き込み先を新しいクラスターに切り替えた後、旧 RustFS や MinIO クラスターに残ったデータを移行できます。設定では `old` が移行元、`new` が移行先です。どちらもバケット名をパスに含める形式でアクセスします。
 
-本番トラフィックの横で動かせます。書き込むコマンドは、次の三つを守ります。
+移行先にないキーをコピーし、競合は `conflict.log` に、進捗はローカルの SQLite に記録します。オブジェクトを削除する操作はありません。移行先は `PutObject` と `CompleteMultipartUpload` の両方で `If-None-Match: *` に対応している必要があります。これにより、存在確認の直後にアプリケーションが同じキーで書き込んだ場合も、そのオブジェクトを保護できます。
 
-- **上書きしない。** 書く前に、ターゲットへ `HeadObject` します。一致すれば完了として記録します。違うオブジェクトはログに残し、そのままにします。
-- **削除しない。** `DeleteObject` はありません。マルチパートアップロードの中止は、その未完了のアップロードだけを捨てます。すでにコミットされたオブジェクトは消しません。
-- **再開できる。** オブジェクトごとにローカルの SQLite に 1 行あります。止めてから再実行しても、終わった作業はやり直されません。
-
-よくある配置は、古いクラスタが履歴を持ち、新しいクラスタがすべての書き込みを受け、アプリケーションがすでに両方を読む、という形です。このツールは、ターゲットにまだないキーを埋めます。ターゲット上の新しいオブジェクトを、ソースの古いバイトで置き換えることはありません。同じキーの衝突はこの配置では想定内です。`conflict.log` を読み、手で解決してください。
-
-コピーされるのは現在のオブジェクトと、`Content-Type`、`Cache-Control`、`Content-Disposition`、`Content-Encoding`、`Content-Language`、`Expires`、ユーザーメタデータ `x-amz-meta-*` です。バージョン履歴、削除マーカー、Object Lock、バケットポリシー、ライフサイクルルールはそのまま残ります。
-
-設定ファイルでは、ソースが `old`、ターゲットが `new` です。
+コピー対象はオブジェクトの内容、`Content-Type`、`Cache-Control`、`Content-Disposition`、`Content-Encoding`、`Content-Language`、`Expires`、および `x-amz-meta-*` のユーザーメタデータです。過去のバージョン、削除マーカー、Object Lock、バケットポリシー、ライフサイクルルールは移行の対象外です。
 
 ## ドキュメント
 
-| 文書 | 内容 |
-| --- | --- |
-| このファイル | 日本語の導入、設定、コマンド、調整、安全性 |
-| [README.md](README.md) | English。同じ構成 |
-| [README_ZH.md](README_ZH.md) | 简体中文 |
-| [README_DE.md](README_DE.md) | Deutsch |
-| [README_FR.md](README_FR.md) | français |
-| [README_ES.md](README_ES.md) | Español |
-| [README_KO.md](README_KO.md) | 한국어 |
-| [README_PT.md](README_PT.md) | Portuguese |
-| [README_RU.md](README_RU.md) | Русский |
-| [docs/USAGE.md](docs/USAGE.md) | 英語の短い補足 |
-| [docs/使用手册.md](docs/使用手册.md) | より詳しい中国語の手引き |
-| [docs/DESIGN.md](docs/DESIGN.md) | アーキテクチャと、ツールが緩めない制約 |
-
-`migration --help` と `migration <command> --help` は、英語と中国語のヘルプを出します。
+[コマンド早見表（英語）](docs/USAGE.md) · [運用ガイド（中国語）](docs/使用手册.md) · [設計資料（英語）](docs/DESIGN.md)
 
 ## クイックスタート
 
-Go 1.22 以降。SQLite は純 Go なので、ビルドに CGO は要りません。
+ソースからビルドする場合は Go 1.22 以降が必要です。設定例をコピーしたら、`config.yaml` に両クラスターの接続先と認証情報を入力してください。
 
 ```bash
 git clone https://github.com/rustfs/migration.git
 cd migration
-cp config.example.yaml config.yaml   # ソースとターゲットのエンドポイントとキー
 CGO_ENABLED=0 go build -o bin/migration .
 # または make build
+cp config.example.yaml config.yaml   # ソースとターゲットのエンドポイントとキー
+```
 
+```bash
 ./bin/migration list   -c config.yaml
 ./bin/migration run    -c config.yaml --workers 16 --rate-limit 20M
 ./bin/migration status -c config.yaml
@@ -64,17 +33,21 @@ CGO_ENABLED=0 go build -o bin/migration .
 
 `bucket:` を空にすると、ソース上のすべてのバケットを移行します。`bucket: photos` か `--bucket photos` で 1 つに固定します。
 
-`20M` は十進のメガバイト毎秒です。20×1000×1000 バイト/秒。共有ネットワークで上げる前に [レート制限](#rate-limit) を読んでください。
+YAML または `BUCKET` にバケット名が設定されていても、`--bucket ""` を指定すれば移行元の全バケットを対象にできます。
+
+`--rate-limit 20M` を指定すると、移行元からの読み取り速度は全ワーカーの合計で毎秒 20,000,000 バイトまでになります。単位の詳細は[帯域制限](#rate-limit)を参照してください。
 
 ## インストール
 
+[Build packages](https://github.com/rustfs/migration/actions/workflows/packages.yml) で成功した実行を開き、**Artifacts** からお使いの環境に合うファイルをダウンロードします。ダウンロードしたファイルを展開し、同梱の SHA-256 でアーカイブを検証してから解凍してください。Linux（amd64、arm64）は `.tar.gz`、Windows（amd64）は `migration.exe` を含む `.zip` 形式です。
+
 ```bash
-git clone https://github.com/rustfs/migration.git
-cd migration
-CGO_ENABLED=0 go build -o bin/migration .
+./migration --version
 ```
 
-`make build` は同じコマンドです。成果物は静的バイナリ `bin/migration` です。`make test` は `go test ./...` です。
+```powershell
+.\migration.exe --version
+```
 
 `config.yaml` は保護してください（`chmod 600` が妥当な初期値です）。プロセスはエンドポイントとオブジェクトキーをログします。資格情報はログしません。
 
@@ -84,7 +57,7 @@ CGO_ENABLED=0 go build -o bin/migration .
 cp config.example.yaml config.yaml
 ```
 
-最低限、両側のエンドポイント、アクセスキー、シークレットキーが必要です。ターゲットにバケットがまだ無いときは、ターゲットのキーに `s3:CreateBucket` が必要です。すでにあるターゲットのバケットは変更しません。
+両クラスターの HTTP または HTTPS の接続先と認証情報を設定します。認証情報は専用の項目に入力してください。URL に認証情報、クエリ、フラグメントは指定できません。移行先にバケットを作成する場合は `s3:CreateBucket` 権限も必要です。
 
 ```yaml
 old:                              # ソース。読み取り専用
@@ -149,7 +122,7 @@ rate_limit: 0                     # ソース読み取りの合計上限。0 ま
 
 負の並列数やサイズは起動時に失敗します。`WORKERS` と `MULTIPART_CONCURRENCY` は整数だけです。単位は `RATE_LIMIT` にだけ付けます。`RATE_LIMIT=20M` は有効で、`WORKERS=20M` は無効です。
 
-`multipart_part_size` は 5 MiB（5242880）以上です。それより小さい非最終パートは、S3 が `EntityTooSmall` で拒否します。より小さい値は設定の読み込み時に失敗します。自動では引き上げません。1 オブジェクトが 10000 パートを超えるときは、収まるようにそのオブジェクトのパートサイズを大きくします。
+`multipart_part_size` は 5 MiB から 5 GiB の範囲で指定します（既定値は 16 MiB）。5 GiB を超えるオブジェクトは必ず分割して転送します。必要に応じてパートを大きくして合計を 10,000 個以内に収めます。1 パートが 5 GiB を超える場合はエラーになります。
 
 バケット名に空白や `/` は使えません。
 
@@ -201,7 +174,7 @@ rate_limit: 0                     # ソース読み取りの合計上限。0 ま
 
 `status` は `BUCKET`、`TOTAL`、`PENDING`、`DONE`、`CONFLICT`、`SKIPPED`、`FAILED` を出します。バケットを固定していないときは、`db_path` の隣の `migration-*.db` を読みます。設定したデータベースがすでにバケットに束縛されていれば、それも読みます。まだ何も無いときはその旨を出して 0 で終了します。先に `scan` か `run` を実行してください。
 
-## 手順
+## 用途別の操作手順
 
 ### すべてのバケットを移行する
 
@@ -215,10 +188,10 @@ rate_limit: 0                     # ソース読み取りの合計上限。0 ま
 バケットごとに、`run` は次を行います。
 
 1. ソースで `HeadBucket`。
-2. ターゲットにバケットが無ければ作る。すでにあるバケットは変更しない。
-3. ソースを `ListObjectsV2` し、SQLite に書く。この段階はシングルスレッド。
-4. `workers` 個のコピーゴルーチンを起動する。各オブジェクトは先にターゲットを `HeadObject` する。無いキーはソースから読み、ターゲットへ書く。このソース読み取りは `rate_limit` を共有する。目録とすでに一致するキーは `done` になり、アップロードしない。存在して一致しないキーは衝突ログへ追記し、上書きしない。
-5. `multipart_threshold` 以上のオブジェクトは、`multipart_concurrency` でパートを送る。パートも同じバイト上限を共有する。
+2. ソースを `ListObjectsV2` し、SQLite に書く。この段階はシングルスレッド。
+3. ターゲットにバケットが無ければ作る。すでにあるバケットは変更しない。
+4. 最大 `workers` 個のオブジェクトを並列にコピーします。最初の HEAD の直後に同じキーが作成されても、条件付き書き込みによって保護されます。移行先を再確認して `done` または `conflict` を記録します。
+5. オブジェクトのサイズが `multipart_threshold` 以上なら、最大 `multipart_concurrency` パートを並列に転送します。すべての読み取りに同じ帯域制限が適用されます。
 6. ターゲット上のサイズを確認する。単一パートのオブジェクトは、ETag が比較できるとき ETag も確認する。[オブジェクトの状態](#resume-and-object-state) を参照。
 
 バケットは一つずつコピーされるので、`rate_limit` がプロセス全体の上限です。
@@ -242,7 +215,7 @@ rate_limit: 0                     # ソース読み取りの合計上限。0 ま
 
 もう一度 `run` するのは、この二段階を 1 コマンドにしたものです。
 
-### 先に棚卸しする
+### 先に一覧を作成する
 
 ```bash
 ./bin/migration scan   -c config.yaml
@@ -252,13 +225,7 @@ rate_limit: 0                     # ソース読み取りの合計上限。0 ま
 
 ## 並列数
 
-三つのつまみは、別々のものを制限します。
-
-| つまみ | 制限するもの | 上げるとき | 下げるとき |
-| --- | --- | --- | --- |
-| `workers` / `--workers` | 同時に飛んでいる**オブジェクト**数。`diff` の HEAD 並列数でもある | 小さいオブジェクトが主で、CPU、ディスク、プロキシに余力がある | 503、タイムアウト、ソースディスクの飽和、または 1 オブジェクトの調査（`--workers 1`） |
-| `multipart_concurrency` / `--multipart-concurrency` | **1 つの大きいオブジェクトのパート**を何本同時に送るか | 1 オブジェクトが大きく、その流れが回線をまだ使える | 大きいオブジェクトがすでに回線を埋めている、または複数が重なってプロキシを埋めている |
-| `rate_limit` / `--rate-limit` | それらの worker が合計で、ソースから毎秒何バイト読めるか | ソースとネットワークに余力がある | 本番がソースクラスタ、または同じ NIC を使っている。`20M` から始め、次に `30M` か `50M` |
+同時にコピーするオブジェクト数は `workers` で調整します。大きなオブジェクトについては、`multipart_concurrency` でオブジェクトごとの同時転送パート数も指定できます。既定値は 16 オブジェクト、各 4 パートなので、1 クラスターあたりの同時リクエスト数は最大でおよそ 64 です。ディスクやプロキシの処理能力、空きメモリを考慮して設定してください。
 
 `scan` は `workers` も `rate_limit` も使いません。一覧は 1 ページずつです。各ページが前の continuation token を必要とし、行は 1 つの SQLite ファイルへ入るからです。走査が遅くても `--workers` では速くなりません。`list`、`diff`、`status` はオブジェクト本体を読まないので、バイト上限は掛かりません。`diff` の HEAD には `--workers` を使います。
 
@@ -270,9 +237,7 @@ workers = 同時に 4 オブジェクト
   オブジェクト D（大）  ── 同じ
 ```
 
-1 クラスタへの同時リクエストのピークは、およそ `workers × multipart_concurrency` です。小さいオブジェクトは 1 リクエストです。マルチパート閾値に達したオブジェクトは、パート並列数を掛けます。既定の `16 × 4` は 64 です。HAProxy または Nginx の `maxconn` と、両クラスタのディスクは、この積を運べる必要があります。
-
-HTTP クライアントは、ホストごとのアイドル接続をこの積まで上げます（上限 1024）。Go の既定はホストあたり 2 本です。これは接続の再利用です。実行中の仕事を縛るのは worker プールとパートのセマフォです。待ち行列はオブジェクト記述を最大 2048 個までなので、大きな `--workers` でもバケット全体をメモリに載せません。
+転送中のパートはそれぞれメモリに保持されます。キューに格納されるオブジェクトの情報は最大 2,048 件です。HTTP 接続は再利用され、待機接続数の上限はホストごとに 1,024 です。
 
 出発点:
 
@@ -297,13 +262,9 @@ HTTP クライアントは、ホストごとのアイドル接続をこの積ま
 
 ## レート制限
 
-`rate_limit` は、すべてのコピー worker が共有する 1 つのトークンバケットです。大きいオブジェクトのパートも含みます。数えるのは、ソースのオブジェクト本体から読んだバイトです。List、HEAD、書く前の衝突確認は上限の外です。読み終えたあとのアップロードは、もう一度は数えません。
+`rate_limit` は、すべてのワーカーとパートを合わせた移行元の読み取り速度を制限します。キーの一覧取得、ヘッダーの取得、移行先へのアップロードは対象外です。
 
-小さいオブジェクトは上限の速度でソースから読み切り、そのあとターゲットへ書きます。ソース側の読み取りは上限以内です。その後の書き込みは短時間だけ速くなることがあります。移行ホストが本番と NIC を共有していると、その書き込みも帯域を使います。NIC 全体をおよそ 40 MB/s 付近に留めたいときは、`20M` から始めてください。
-
-上限はコピーを遅くするだけです。上書きせず、削除もしません。目録とすでに一致するオブジェクトは、引き続きスキップされます。最初の Ctrl-C は、トークン待ちの読み取りを取り消します。終わっていないオブジェクトは SQLite に残り、次の `migrate` で続きます。
-
-上限は、飛んでいるリクエストの数を減らしません。プロキシが 503 を返すのは、依然として並列数の問題です。先に `workers`、次に `multipart_concurrency` を下げてください。
+小さいオブジェクトはいったんローカルディスクに保存してからアップロードします。読み取りとアップロードが同じネットワークインターフェースを使う場合は、アップロードに必要な帯域も考慮して読み取り速度を設定してください。
 
 ### 単位
 
@@ -341,7 +302,7 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 
 最初の Ctrl-C または `SIGTERM` は worker プールを取り消します。まだ始まっていないオブジェクトは `pending` のままです。進行中のマルチパートは中止され、そのアップロードだけが解放されます。コミット済みオブジェクトは削除されません。すでに SQLite へ書いた状態は残ります。二度目のシグナルは即座に終了し、終了コードは 130 です。
 
-ターゲットの `PutObject` が成功したあと、行がまだ `done` になっていないと、オブジェクトはターゲットにあるのに行は `failed`（または `pending`）のままです。次の `migrate` はターゲットを `HeadObject` します。サイズが一致し、比較できる ETag も一致すれば `done` になります。サイズが違う、または比較できる ETag が違うときは `conflict` になり、それでも上書きしません。
+スキャン後、コピーするまでに移行元の ETag が変わると転送は失敗します。`scan` で一覧を更新してから `migrate` を再実行するか、`run` を再実行してください。
 
 取り消されたリクエスト、デッドライン、`request canceled` は `failed` です。エラー文に `NotFound` や `StatusCode: 404` が含まれていても同じです。マルチパートの中止はしばしば `NoSuchUpload` を返します。それはソースオブジェクトの欠落ではありません。`skipped` は、ソースのリクエストが完了し、オブジェクトが本当に無くなっていたことを意味します。
 
@@ -359,7 +320,7 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 | `done` | コピーして検証した、またはターゲットがすでに目録と一致していた | 変えない |
 | `conflict` | ターゲットにキーがあり、目録と一致しない。上書きしていない | 変えない |
 
-**一致の規則。** サイズは目録のサイズと等しくなければなりません。ETag を比べるのは、両側に ETag があり、どちらもマルチパート ETag（`-` を含み、`hash-N` の形）ではないときだけです。マルチパート ETag はパート境界に依存するので比べず、サイズだけを見ます。サイズが違う、または比較できる ETag が違うときは衝突です。
+同じキーがすでにある場合、サイズが等しく、双方の ETag が空でなく一致するときだけ `done` と記録します。それ以外は `conflict` として移行先のオブジェクトを保持します。内容が同じでも、パートの区切り方によって ETag は異なります。アップロード直後に処理が中断した場合は、この種の競合を個別に確認してください。
 
 衝突は衝突ログに TSV で 1 行です。時刻は RFC3339 の UTC です。
 
@@ -367,16 +328,18 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 <object-key>	<source-LastModified>	<target-LastModified>
 ```
 
+制御文字を含むキーや二重引用符で始まるキーは、Go の文字列リテラルと同じ形式でエスケープして記録します。
+
 バケットを 1 つだけ設定したときは、書いたとおりの `db_path` と `conflict_log` を使います。全バケットモードは隣に次のファイルを作ります。
 
 - `migration-<bucket>.db`
 - `conflict-<bucket>.log`
 
-データベースファイルは 1 つのバケットに束縛されます。別のバケットに向けると、`db_path is bound to bucket "…"` で失敗します。
+`migrate` の実行には、`scan` または `run` で作成した一覧が必要です。状態データベースにはバケットと接続先が記録されます。旧版のデータベースを使う場合は対象のクラスターを確認してください。更新後、最初のスキャンで移行元が、最初の移行で移行先が登録されます。 スキャンが中断または失敗した場合は、`migrate` の前に `scan` または `run` を再実行してください。旧版のデータベースにはスキャン完了の記録がないため、一覧が完全か判断できない場合は再スキャンしてください。
 
 ## diff でターゲットを確認する
 
-`diff` はソースのバケットをその場で列挙し、ターゲットの各キーを `HEAD` します。移行用の SQLite 目録は読まず、アップロードもしません。
+`diff` はオブジェクトをダウンロードせず、サイズと比較可能な ETag を照合します。`size_only` は `ok` のうちサイズだけを確認した件数です。`--extra` を付けると、一時インデックスを使って移行先だけに存在するキーも報告します。 移行元のバケットが空でも、`diff` は移行先にバケットが存在するかを確認します。存在しない場合の終了コードは 1 です。
 
 ```bash
 ./bin/migration diff -c config.yaml --workers 32
@@ -385,8 +348,8 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 
 ```text
 === diff photos ===
-ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
-一致=1000  缺失=2  大小不一致=0  ETag不一致=1  仅目标有=0
+ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0  size_only=3
+一致=1000  缺失=2  大小不一致=0  ETag不一致=1  仅目标有=0  仅比大小=3
   missing  a.txt  not on target
   etag     b.txt  src=abc dst=def
 ```
@@ -395,7 +358,7 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
 
 | 結果 | 意味 |
 | --- | --- |
-| `missing` | ソースにあり、ターゲットに無い。`migrate` か `run` を再実行 |
+| `missing` | 移行元には存在するが、移行先では見つからないキー |
 | `size` / `etag` | 同じキーで内容が一致しない。ターゲットへの本番書き込みであることが多い。このツールは上書きしない |
 | `extra` | ターゲットにしか無い。`--extra` で出る。通常は新しいクラスタへすでに書かれたデータ。失敗ではない |
 
@@ -405,7 +368,7 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
 
 | 保証 | 方法 |
 | --- | --- |
-| ターゲットのオブジェクトを上書きしない | 書く前に必ず `HeadObject`。一致は `done`。不一致は `conflict.log` に書いてスキップ |
+| ターゲットのオブジェクトを上書きしない | `HeadObject` → `PutObject` / `CompleteMultipartUpload` (`If-None-Match: *`) |
 | 削除しない | `DeleteObject` は無い。失敗したマルチパートは中止するだけ |
 | バケットを取り違えない | `HeadBucket`、各リストページのバケット名確認、SQLite ファイルに保存したバケット名 |
 | 実行中にソースが削除される | 完了したソース 404 は `skipped`。取り消しとタイムアウトは `failed` になり、再試行される |
@@ -431,19 +394,19 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
 | `scan` や `diff` が遅くならない | 想定どおり。上限が掛かるのは `run` / `migrate` がオブジェクト本体を読むとき |
 | `--workers` を上げても走査が遅い | 想定どおり。`scan` はシングルスレッド。並列はコピーから、および `diff` の HEAD から |
 | 503 やタイムアウトが多い | `workers` を下げる。大きいオブジェクトなら `multipart_concurrency` も下げ、`workers × multipart_concurrency` をプロキシの `maxconn` に収める |
-| `etag mismatch` が多い | ソースの SSE や圧縮が ETag を変えることがある。`multipart_threshold` を下げてマルチパートにする（サイズは見て、ETag は比べない）か、手で抜き取り確認する |
+| `etag mismatch` が多い | 対象オブジェクトの内容を個別に照合してください。パートの分割方法やサーバー側の暗号化によって ETag が変わることがあります。 |
 | `db_path is bound to bucket "…"` | そのファイルは別のバケットに束縛済み。別の `db_path` を使う |
 | `database is locked` | 二つのプロセスが同じデータベースを書いている。ファイルにつきプロセスは 1 つ |
 | 一時ファイルでディスクが埋まる | `spool_dir` を大きいディスクへ移すか、`workers` を下げる |
 | Ctrl-C で戻らない | 進行中のリクエストを待つか、もう一度押す（終了コード 130） |
-| `diff` がまだ `missing` を出す | `migrate` を再実行し、`failed` 行の `last_error` を読む |
+| `diff` がまだ `missing` を出す | `failed` の場合は `last_error` を確認して再試行します。`done` または `conflict` の場合は、別のディレクトリに新しい一覧を作成してください。全バケットを対象とする場合、データベースのファイル名を変えるだけでは一覧を切り替えられません。 |
 
 ## 終了コード
 
 | コード | 意味 |
 | --- | --- |
-| 0 | 成功。バケットが 1 つのとき、コピー段階の最初の Ctrl-C（`migrate`、または `run` のコピー側）も 0。終わっていないオブジェクトは SQLite に残る |
-| 1 | 設定の誤り、リモートのエラー、バケットの失敗、または `diff` が欠落か不一致を見つけた。`scan` 中の最初の Ctrl-C、および複数バケットの実行中の中断も 1 |
+| 0 | 処理が完了しました。競合とスキップは別途集計されます。 |
+| 1 | 設定エラー、処理の中断、操作またはコピーの失敗、あるいは `diff` による欠落・不一致の検出。 |
 | 130 | 二度目の `SIGINT` または `SIGTERM`。プロセスはすぐに終了する |
 
 コマンドのエラーは stderr に `error: …` と出ます。

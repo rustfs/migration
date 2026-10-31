@@ -1,61 +1,30 @@
 # migration
 
-<p align="center">
-  <a href="https://github.com/rustfs/migration/blob/main/README.md">English</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_ZH.md">简体中文</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_DE.md">Deutsch</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_ES.md">Español</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_FR.md">français</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_JA.md">日本語</a> |
-  한국어 |
-  <a href="https://github.com/rustfs/migration/blob/main/README_PT.md">Portuguese</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_RU.md">Русский</a>
-</p>
+[English](README.md) | [简体中文](README_ZH.md) | [Deutsch](README_DE.md) | [Español](README_ES.md) | [Français](README_FR.md) | [日本語](README_JA.md) | **한국어** | [Português](README_PT.md) | [Русский](README_RU.md)
 
-`migration`은 S3 호환 클러스터 사이에서 객체를 한 방향으로 복사합니다. 대상은 직접 운영하는 RustFS와 MinIO, 그리고 S3 API를 말하는 다른 엔드포인트입니다. 요청은 항상 path-style 주소 지정을 사용합니다. 이런 클러스터에서는 그것이 일반적인 방식입니다.
+`migration`은 S3 호환 클러스터 간에 객체의 현재 버전을 복사하는 도구입니다. 애플리케이션의 쓰기 요청을 새 클러스터로 전환한 뒤에도 기존 RustFS 또는 MinIO 클러스터에 남은 데이터를 옮길 수 있습니다. 설정에서 `old`는 원본, `new`는 대상을 가리킵니다. 두 클러스터 모두 URL 경로에 버킷 이름을 넣는 방식을 사용합니다.
 
-운영 트래픽 옆에서 실행할 수 있습니다. 쓰는 명령은 다음 세 가지를 지킵니다.
+대상에 없는 키만 복사하고 충돌은 `conflict.log`에, 진행 상황은 로컬 SQLite 데이터베이스에 기록합니다. 객체는 삭제하지 않습니다. 대상에서는 `PutObject`와 `CompleteMultipartUpload` 모두 `If-None-Match: *` 조건을 지원해야 합니다. 그래야 존재 여부를 확인한 직후 애플리케이션이 같은 키로 쓴 객체도 보호할 수 있습니다.
 
-- **덮어쓰지 않습니다.** 쓰기 전에 대상에 `HeadObject`를 호출합니다. 일치하면 완료로 기록합니다. 다른 객체는 로그만 남기고 그대로 둡니다.
-- **삭제하지 않습니다.** `DeleteObject` 호출이 없습니다. 멀티파트 업로드를 중단하면 그 미완료 업로드만 버리며, 이미 커밋된 객체는 지우지 않습니다.
-- **이어서 할 수 있습니다.** 객체마다 로컬 SQLite에 한 행이 있습니다. 멈췄다가 다시 실행해도 끝난 작업은 반복하지 않습니다.
-
-흔한 배치는 옛 클러스터가 이력을 갖고, 새 클러스터가 모든 쓰기를 받으며, 애플리케이션이 이미 양쪽을 읽는 형태입니다. 이 도구는 대상에 아직 없는 키를 채웁니다. 대상의 더 새로운 객체를 원본의 더 오래된 바이트로 바꾸지 않습니다. 같은 키의 충돌은 이 배치에서 예상된 일입니다. `conflict.log`를 읽고 손으로 처리하십시오.
-
-복사되는 것은 현재 객체와 `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`, `Expires`, 사용자 메타데이터 `x-amz-meta-*`입니다. 버전 이력, 삭제 마커, Object Lock, 버킷 정책, 수명 주기 규칙은 그 자리에 남습니다.
-
-설정 파일에서 원본은 `old`, 대상은 `new`입니다.
+현재 객체의 본문과 `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`, `Expires` 헤더, `x-amz-meta-*` 사용자 메타데이터가 복사됩니다. 이전 버전, 삭제 마커, Object Lock, 버킷 정책, 수명 주기 규칙은 이전 대상에서 제외됩니다.
 
 ## 문서
 
-| 문서 | 내용 |
-| --- | --- |
-| 이 파일 | 한국어 설치, 설정, 명령, 조정, 안전 |
-| [README.md](README.md) | English, 같은 구성 |
-| [README_ZH.md](README_ZH.md) | 简体中文 |
-| [README_DE.md](README_DE.md) | Deutsch |
-| [README_ES.md](README_ES.md) | Español |
-| [README_FR.md](README_FR.md) | français |
-| [README_JA.md](README_JA.md) | 日本語 |
-| [README_PT.md](README_PT.md) | Portuguese |
-| [README_RU.md](README_RU.md) | Русский |
-| [docs/USAGE.md](docs/USAGE.md) | 영어 짧은 보충 |
-| [docs/使用手册.md](docs/使用手册.md) | 더 긴 중국어 안내 |
-| [docs/DESIGN.md](docs/DESIGN.md) | 구조와, 도구가 완화하지 않는 제약 |
-
-`migration --help`와 `migration <command> --help`는 영어와 중국어 도움말을 출력합니다.
+[명령어 요약(영어)](docs/USAGE.md) · [운영 안내서(중국어)](docs/使用手册.md) · [설계 문서(영어)](docs/DESIGN.md)
 
 ## 빠른 시작
 
-Go 1.22 이상. SQLite는 순수 Go이므로 빌드에 CGO가 필요 없습니다.
+아래와 같이 소스에서 빌드하려면 Go 1.22 이상이 필요합니다. 설정 예제를 복사한 뒤 `config.yaml`에 두 클러스터의 주소와 인증 정보를 입력하세요.
 
 ```bash
 git clone https://github.com/rustfs/migration.git
 cd migration
-cp config.example.yaml config.yaml   # 원본과 대상의 엔드포인트와 키
 CGO_ENABLED=0 go build -o bin/migration .
 # 또는 make build
+cp config.example.yaml config.yaml   # 원본과 대상의 엔드포인트와 키
+```
 
+```bash
 ./bin/migration list   -c config.yaml
 ./bin/migration run    -c config.yaml --workers 16 --rate-limit 20M
 ./bin/migration status -c config.yaml
@@ -64,17 +33,21 @@ CGO_ENABLED=0 go build -o bin/migration .
 
 `bucket:`을 비우면 원본의 모든 버킷을 옮깁니다. `bucket: photos` 또는 `--bucket photos`로 하나를 고정합니다.
 
-`20M`은 십진 메가바이트/초입니다. 20×1000×1000 바이트/초. 공유 네트워크에서 올리기 전에 [속도 제한](#rate-limit)을 읽으십시오.
+YAML 또는 `BUCKET`에 버킷 이름이 지정되어 있어도 `--bucket ""`을 사용하면 원본의 모든 버킷을 선택할 수 있습니다.
+
+`--rate-limit 20M`은 모든 작업자가 원본에서 읽는 속도의 합계를 초당 20,000,000바이트로 제한합니다. 다른 단위는 [속도 제한](#rate-limit)을 참고하세요.
 
 ## 설치
 
+[Build packages](https://github.com/rustfs/migration/actions/workflows/packages.yml)에서 성공한 실행을 열고 **Artifacts**에서 사용 환경에 맞는 파일을 받습니다. 다운로드한 파일을 풀고 포함된 SHA-256 값으로 패키지를 확인한 다음 압축을 해제합니다. Linux(amd64, arm64) 패키지는 `.tar.gz`, Windows(amd64) 패키지는 `migration.exe`가 들어 있는 `.zip` 파일입니다.
+
 ```bash
-git clone https://github.com/rustfs/migration.git
-cd migration
-CGO_ENABLED=0 go build -o bin/migration .
+./migration --version
 ```
 
-`make build`는 같은 명령입니다. 결과는 정적 바이너리 `bin/migration`입니다. `make test`는 `go test ./...`입니다.
+```powershell
+.\migration.exe --version
+```
 
 `config.yaml`을 보호하십시오(`chmod 600`이 합리적인 기본값입니다). 프로세스는 엔드포인트와 객체 키를 로그합니다. 자격 증명은 로그하지 않습니다.
 
@@ -84,7 +57,7 @@ CGO_ENABLED=0 go build -o bin/migration .
 cp config.example.yaml config.yaml
 ```
 
-최소한 양쪽의 엔드포인트, 액세스 키, 시크릿 키가 필요합니다. 대상에 버킷이 아직 없으면 대상 키에 `s3:CreateBucket`이 필요합니다. 이미 있는 대상 버킷은 바꾸지 않습니다.
+각 클러스터의 HTTP 또는 HTTPS 주소와 인증 정보를 설정합니다. 인증 정보는 전용 필드에 입력하세요. URL에 인증 정보, 쿼리 문자열 또는 프래그먼트를 포함할 수 없습니다. 대상에 버킷을 만들려면 `s3:CreateBucket` 권한이 필요합니다.
 
 ```yaml
 old:                              # 원본, 읽기 전용
@@ -149,7 +122,7 @@ rate_limit: 0                     # 원본 읽기 합계 상한. 0 또는 생략
 
 음수 병렬 수나 크기는 시작 시 실패합니다. `WORKERS`와 `MULTIPART_CONCURRENCY`는 정수만 가능합니다. 단위는 `RATE_LIMIT`에만 붙입니다. `RATE_LIMIT=20M`은 유효하고 `WORKERS=20M`은 유효하지 않습니다.
 
-`multipart_part_size`는 5 MiB(5242880) 이상이어야 합니다. 더 작은 비최종 파트는 S3가 `EntityTooSmall`로 거부합니다. 더 작은 값은 설정 로드 때 실패합니다. 자동으로 올리지 않습니다. 한 객체가 10000 파트를 넘기면, 업로드가 들어가도록 그 객체의 파트 크기를 키웁니다.
+`multipart_part_size`는 5 MiB에서 5 GiB 사이로 설정하며 기본값은 16 MiB입니다. 5 GiB보다 큰 객체는 항상 파트를 나눠 전송합니다. 파트 수를 10,000개 이하로 유지하기 위해 필요하면 파트 크기를 늘립니다. 파트 하나가 5 GiB를 초과해야 하면 전송이 실패합니다.
 
 버킷 이름에 공백이나 `/`를 넣을 수 없습니다.
 
@@ -215,10 +188,10 @@ rate_limit: 0                     # 원본 읽기 합계 상한. 0 또는 생략
 버킷마다 `run`은 다음을 합니다.
 
 1. 원본에서 `HeadBucket`.
-2. 대상에 버킷이 없으면 만듭니다. 이미 있는 버킷은 바꾸지 않습니다.
-3. 원본을 `ListObjectsV2`하여 SQLite에 씁니다. 이 단계는 단일 스레드입니다.
-4. `workers`개의 복사 고루틴을 시작합니다. 각 객체는 먼저 대상을 `HeadObject`합니다. 없는 키는 원본에서 읽어 대상에 씁니다. 이 원본 읽기는 `rate_limit`을 공유합니다. 목록과 이미 일치하는 키는 `done`이 되고 업로드하지 않습니다. 있지만 일치하지 않는 키는 충돌 로그에 추가하고 덮어쓰지 않습니다.
-5. `multipart_threshold` 이상인 객체는 `multipart_concurrency`로 파트를 올립니다. 파트도 같은 바이트 상한을 공유합니다.
+2. 원본을 `ListObjectsV2`하여 SQLite에 씁니다. 이 단계는 단일 스레드입니다.
+3. 대상에 버킷이 없으면 만듭니다. 이미 있는 버킷은 바꾸지 않습니다.
+4. 객체를 최대 `workers`개씩 복사합니다. 첫 HEAD 요청 직후 다른 애플리케이션이 같은 키를 만들더라도 조건부 쓰기로 해당 객체를 보호합니다. 대상 키를 다시 확인해 `done` 또는 `conflict`로 기록합니다.
+5. 객체 크기가 `multipart_threshold` 이상이면 객체당 최대 `multipart_concurrency`개의 파트를 동시에 전송합니다. 원본에서 읽는 모든 작업에는 같은 대역폭 제한이 적용됩니다.
 6. 대상의 크기를 확인합니다. 단일 파트 객체는 ETag를 비교할 수 있을 때 ETag도 확인합니다. [객체 상태](#resume-and-object-state)를 보십시오.
 
 버킷은 하나씩 복사되므로 `rate_limit`이 프로세스 전체의 상한입니다.
@@ -250,15 +223,9 @@ rate_limit: 0                     # 원본 읽기 합계 상한. 0 또는 생략
 ./bin/migration migrate -c config.yaml --workers 16
 ```
 
-## 병렬
+## 동시 전송 설정
 
-세 조절은 서로 다른 것을 제한합니다.
-
-| 조절 | 제한하는 것 | 올릴 때 | 내릴 때 |
-| --- | --- | --- | --- |
-| `workers` / `--workers` | 동시에 날고 있는 **객체** 수. `diff`의 HEAD 병렬이기도 함 | 작은 객체가 대부분이고 CPU, 디스크, 프록시에 여유가 있을 때 | 503, 시간 초과, 원본 디스크 포화, 또는 객체 하나를 조사할 때 (`--workers 1`) |
-| `multipart_concurrency` / `--multipart-concurrency` | **큰 객체 하나의 파트**를 몇 개 동시에 올리는지 | 객체 하나가 크고 그 흐름이 회선을 더 쓸 수 있을 때 | 큰 객체가 이미 회선을 채우거나, 여러 개가 겹쳐 프록시를 채울 때 |
-| `rate_limit` / `--rate-limit` | 그 worker들이 합쳐서 원본에서 초당 몇 바이트를 읽을 수 있는지 | 원본과 네트워크에 여유가 있을 때 | 운영이 원본 클러스터나 같은 NIC를 쓸 때. `20M`부터 시작하고 `30M` 또는 `50M`을 시도 |
+`workers`로 동시에 복사할 객체 수를 지정합니다. 대용량 객체의 경우 `multipart_concurrency`로 객체 하나당 동시에 전송할 파트 수도 조절할 수 있습니다. 기본값은 객체 16개, 객체당 파트 4개이므로 한 클러스터에 약 64개까지 동시에 요청할 수 있습니다. 디스크와 프록시의 처리량, 가용 메모리를 고려해 값을 조정하세요.
 
 `scan`은 `workers`와 `rate_limit`을 쓰지 않습니다. 목록은 한 페이지씩입니다. 각 페이지가 이전 continuation token이 필요하고, 행은 하나의 SQLite 파일에 들어가기 때문입니다. 목록이 느려도 `--workers`로는 빨라지지 않습니다. `list`, `diff`, `status`는 객체 본문을 읽지 않으므로 바이트 상한이 적용되지 않습니다. `diff`의 HEAD에는 `--workers`를 씁니다.
 
@@ -270,9 +237,7 @@ workers = 동시에 4개 객체
   객체 D (큼)    ── 같음
 ```
 
-한 클러스터로 가는 동시 요청의 정점은 대략 `workers × multipart_concurrency`입니다. 작은 객체는 요청 하나입니다. 멀티파트 임계값에 도달한 객체는 파트 병렬 수를 곱합니다. 기본 `16 × 4`는 64입니다. HAProxy 또는 Nginx의 `maxconn`과 양쪽 클러스터의 디스크는 이 곱을 감당해야 합니다.
-
-HTTP 클라이언트는 호스트당 유휴 연결을 이 곱까지 올립니다(상한 1024). Go 기본값은 호스트당 2개입니다. 이것은 연결 재사용입니다. 진행 중인 작업을 묶는 것은 worker 풀과 파트 세마포어입니다. 대기열은 객체 설명을 최대 2048개까지 두므로, `--workers`를 크게 해도 버킷 전체를 메모리에 올리지 않습니다.
+전송 중인 각 파트는 메모리에 버퍼링됩니다. 작업 대기열에는 최대 2,048개의 객체 정보가 들어갑니다. HTTP 연결은 재사용되며 호스트마다 최대 1,024개의 유휴 연결을 유지할 수 있습니다.
 
 출발점:
 
@@ -297,13 +262,9 @@ HTTP 클라이언트는 호스트당 유휴 연결을 이 곱까지 올립니다
 
 ## 속도 제한
 
-`rate_limit`은 모든 복사 worker가 공유하는 토큰 버킷 하나입니다. 큰 객체의 파트도 포함합니다. 세는 것은 원본 객체 본문에서 읽은 바이트입니다. List, HEAD, 쓰기 전 충돌 확인은 상한 밖입니다. 읽기가 끝난 뒤의 업로드는 다시 세지 않습니다.
+`rate_limit`은 모든 작업자와 파트가 원본에서 읽는 속도의 합계를 제한합니다. 키 목록 조회, 헤더 조회, 대상에 업로드하는 트래픽은 포함하지 않습니다.
 
-작은 객체는 상한 속도로 원본에서 다 읽은 다음 대상에 씁니다. 원본 읽기는 상한 안에 있습니다. 그 다음 쓰기는 잠깐 더 빠를 수 있습니다. 이전 호스트가 운영과 NIC를 공유하면 그 쓰기도 대역을 씁니다. NIC 전체를 약 40 MB/s 근처에 두고 싶으면 `20M`부터 시작하십시오.
-
-상한은 복사를 느리게 할 뿐입니다. 덮어쓰지 않고 삭제하지도 않습니다. 목록과 이미 일치하는 객체는 계속 건너뜁니다. 첫 Ctrl-C는 토큰을 기다리는 읽기를 취소합니다. 끝나지 않은 객체는 SQLite에 남고 다음 `migrate`에서 이어집니다.
-
-상한은 날고 있는 요청 수를 줄이지 않습니다. 프록시가 503을 주는 것은 여전히 병렬 문제입니다. 먼저 `workers`, 다음으로 `multipart_concurrency`를 낮추십시오.
+작은 객체는 먼저 로컬 디스크에 저장한 뒤 대상에 업로드합니다. 두 작업이 같은 네트워크 인터페이스를 쓴다면 읽기 속도를 설정할 때 업로드에 필요한 대역폭도 남겨 두세요.
 
 ### 단위
 
@@ -341,7 +302,7 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 
 첫 Ctrl-C 또는 `SIGTERM`은 worker 풀을 취소합니다. 아직 시작하지 않은 객체는 `pending`으로 남습니다. 진행 중인 멀티파트는 중단되어 그 업로드만 놓습니다. 커밋된 객체는 삭제하지 않습니다. 이미 SQLite에 쓴 상태는 남습니다. 두 번째 신호는 즉시 종료하고 종료 코드는 130입니다.
 
-대상의 `PutObject`가 성공한 뒤 행이 아직 `done`이 아니면, 객체는 대상에 있는데 행은 `failed`(또는 `pending`)로 남습니다. 다음 `migrate`는 대상을 `HeadObject`합니다. 크기가 일치하고 비교 가능한 ETag도 일치하면 `done`이 됩니다. 크기가 다르거나 비교 가능한 ETag가 다르면 `conflict`가 되고, 그래도 덮어쓰지 않습니다.
+스캔 이후 복사하기 전에 원본 ETag가 바뀌면 복사가 실패합니다. `scan`으로 목록을 갱신한 후 `migrate`를 다시 실행하거나 `run`을 다시 실행하세요.
 
 취소된 요청, 기한, `request canceled`는 `failed`입니다. 오류 문에 `NotFound`나 `StatusCode: 404`가 있어도 같습니다. 멀티파트 중단은 종종 `NoSuchUpload`를 돌려줍니다. 그것은 원본 객체가 없는 것이 아닙니다. `skipped`는 원본 요청이 끝났고 객체가 정말로 없어졌다는 뜻입니다.
 
@@ -359,7 +320,7 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 | `done` | 복사하고 확인했거나, 대상이 이미 목록과 일치 | 그대로 둠 |
 | `conflict` | 대상에 키가 있고 목록과 일치하지 않음. 덮어쓰지 않음 | 그대로 둠 |
 
-**일치 규칙.** 크기는 목록의 크기와 같아야 합니다. ETag를 비교하는 것은 양쪽에 ETag가 있고, 어느 쪽도 멀티파트 ETag(`-`를 포함하고 `hash-N` 형태)가 아닐 때뿐입니다. 멀티파트 ETag는 파트 경계에 의존하므로 비교하지 않고 크기만 봅니다. 크기가 다르거나 비교 가능한 ETag가 다르면 충돌입니다.
+대상에 같은 키가 있으면 크기가 같고 양쪽 ETag가 모두 비어 있지 않으며 일치할 때만 `done`으로 기록합니다. 나머지는 `conflict`로 기록하고 대상 객체를 그대로 둡니다. 내용이 같아도 파트를 나누는 위치에 따라 ETag가 달라질 수 있습니다. 업로드 직후 작업이 중단되었다면 이런 충돌을 개별적으로 확인하세요.
 
 충돌은 충돌 로그에 TSV 한 줄입니다. 시각은 RFC3339 UTC입니다.
 
@@ -367,16 +328,18 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 <object-key>	<source-LastModified>	<target-LastModified>
 ```
 
+제어 문자가 포함되어 있거나 큰따옴표로 시작하는 키는 Go 문자열 리터럴 형식으로 이스케이프해 기록합니다.
+
 버킷을 하나만 설정하면 적은 그대로의 `db_path`와 `conflict_log`를 씁니다. 모든 버킷 모드는 옆에 다음 파일을 만듭니다.
 
 - `migration-<bucket>.db`
 - `conflict-<bucket>.log`
 
-데이터베이스 파일은 버킷 하나에 묶입니다. 다른 버킷으로 돌리면 `db_path is bound to bucket "…"`로 실패합니다.
+`migrate`를 실행하려면 먼저 `scan` 또는 `run`으로 목록을 만들어야 합니다. 상태 데이터베이스에는 버킷과 접속 주소가 기록됩니다. 이전 버전의 데이터베이스를 재사용하기 전에 대상 클러스터가 맞는지 확인하세요. 업데이트 후 첫 스캔에서 원본 주소를, 첫 이전에서 대상 주소를 기록합니다. 스캔이 실패하거나 중단되었다면 `migrate`를 실행하기 전에 `scan` 또는 `run`을 다시 실행하세요. 이전 버전의 데이터베이스에는 스캔 완료 여부가 기록되지 않으므로 목록이 완전한지 알 수 없다면 다시 스캔하세요.
 
 ## diff로 대상 확인
 
-`diff`는 원본 버킷을 그 자리에서 나열하고 대상의 각 키를 `HEAD`합니다. 이전용 SQLite 목록은 읽지 않고 업로드도 하지 않습니다.
+`diff`는 객체를 다운로드하지 않고 크기와 비교 가능한 ETag를 대조합니다. `size_only`는 `ok`에 포함된 객체 중 크기만 확인한 개수입니다. `--extra`를 지정하면 임시 색인을 만들어 대상에만 있는 키도 표시합니다. 원본 버킷이 비어 있어도 `diff`는 대상 버킷이 있는지 확인하며, 없으면 종료 코드 1을 반환합니다.
 
 ```bash
 ./bin/migration diff -c config.yaml --workers 32
@@ -385,8 +348,8 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 
 ```text
 === diff photos ===
-ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
-一致=1000  缺失=2  大小不一致=0  ETag不一致=1  仅目标有=0
+ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0  size_only=3
+一致=1000  缺失=2  大小不一致=0  ETag不一致=1  仅目标有=0  仅比大小=3
   missing  a.txt  not on target
   etag     b.txt  src=abc dst=def
 ```
@@ -395,7 +358,7 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
 
 | 결과 | 의미 |
 | --- | --- |
-| `missing` | 원본에 있고 대상에 없음. `migrate` 또는 `run`을 다시 실행 |
+| `missing` | 원본에는 있지만 대상에는 없는 키 |
 | `size` / `etag` | 같은 키인데 내용이 다름. 대상에 이미 쓰인 경우가 많음. 이 도구는 덮어쓰지 않음 |
 | `extra` | 대상에만 있음. `--extra`로 보고. 보통 새 클러스터에 이미 쓰인 데이터. 실패가 아님 |
 
@@ -405,7 +368,7 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
 
 | 보장 | 방법 |
 | --- | --- |
-| 대상 객체를 덮어쓰지 않음 | 쓰기 전 항상 `HeadObject`. 일치는 `done`. 불일치는 `conflict.log`에 쓰고 건너뜀 |
+| 대상 객체를 덮어쓰지 않음 | `HeadObject` → `PutObject` / `CompleteMultipartUpload` (`If-None-Match: *`) |
 | 삭제하지 않음 | `DeleteObject`가 없음. 실패한 멀티파트는 중단만 함 |
 | 버킷을 섞지 않음 | `HeadBucket`, 각 목록 페이지의 버킷 이름 확인, SQLite 파일에 저장한 버킷 이름 |
 | 실행 중 원본이 삭제됨 | 끝난 원본 404는 `skipped`. 취소와 시간 초과는 `failed`이며 다시 시도됨 |
@@ -431,19 +394,19 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
 | `scan`이나 `diff`가 느려지지 않음 | 예상된 동작. 상한은 `run` / `migrate`가 객체 본문을 읽을 때만 적용 |
 | `--workers`를 올려도 목록이 느림 | 예상된 동작. `scan`은 단일 스레드. 병렬은 복사와 `diff` HEAD부터 |
 | 503이나 시간 초과가 많음 | `workers`를 낮춤. 큰 객체이면 `multipart_concurrency`도 낮춰 `workers × multipart_concurrency`가 프록시 `maxconn` 안에 들어가게 함 |
-| `etag mismatch`가 많음 | 원본의 SSE나 압축이 ETag를 바꿀 수 있음. `multipart_threshold`를 낮춰 멀티파트로 가거나(크기는 보고 ETag는 비교하지 않음), 손으로 표본 확인 |
+| `etag mismatch`가 많음 | 해당 객체의 내용을 별도로 확인하세요. 파트를 나누는 방식이나 서버 측 암호화에 따라 ETag가 달라질 수 있습니다. |
 | `db_path is bound to bucket "…"` | 그 파일은 이미 다른 버킷에 묶임. 다른 `db_path`를 사용 |
 | `database is locked` | 두 프로세스가 같은 데이터베이스를 씀. 파일당 프로세스는 하나 |
 | 임시 파일로 디스크가 참 | `spool_dir`을 큰 디스크로 옮기거나 `workers`를 낮춤 |
 | Ctrl-C가 돌아오지 않음 | 진행 중인 요청을 기다리거나 한 번 더 누름(종료 코드 130) |
-| `diff`가 아직 `missing`을 냄 | `migrate`를 다시 실행하고 `failed` 행의 `last_error`를 읽음 |
+| `diff`가 아직 `missing`을 냄 | `failed`라면 `last_error`를 확인한 뒤 다시 시도하세요. `done` 또는 `conflict`라면 별도의 디렉터리에 새 목록을 만드세요. 모든 버킷을 이전할 때는 데이터베이스 파일 이름만 바꿔서는 새 목록을 만들 수 없습니다. |
 
 ## 종료 코드
 
 | 코드 | 의미 |
 | --- | --- |
-| 0 | 성공. 버킷이 하나일 때 복사 단계의 첫 Ctrl-C(`migrate`, 또는 `run`의 복사 절반)도 0. 끝나지 않은 객체는 SQLite에 남음 |
-| 1 | 잘못된 설정, 원격 오류, 버킷 실패, 또는 `diff`가 누락이나 불일치를 찾음. `scan` 중 첫 Ctrl-C, 그리고 버킷이 둘 이상인 실행 중의 중단도 1 |
+| 0 | 작업을 완료했습니다. 충돌한 객체와 건너뛴 객체는 별도로 집계합니다. |
+| 1 | 설정 오류, 작업 중단, 작업 또는 복사 실패, 또는 `diff`에서 누락이나 불일치를 발견했습니다. |
 | 130 | 두 번째 `SIGINT` 또는 `SIGTERM`. 프로세스가 즉시 종료 |
 
 명령 오류는 stderr에 `error: …`로 나옵니다.

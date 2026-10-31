@@ -1,6 +1,7 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -151,4 +152,65 @@ func TestOpenExistingReadsBoundBucket(t *testing.T) {
 
 func itoa2(i int) string {
 	return string([]byte{'0' + byte(i/10), '0' + byte(i%10)})
+}
+
+func TestLegacyInventoryBindsEndpointsWithoutLosingProgress(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state#1.db")
+	st, err := Open(path, "photos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`DELETE FROM meta WHERE key != 'bucket'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BatchUpsertScanned([]Object{{Key: "old"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkStatus("old", StatusDone, ""); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	st, err = OpenInventory(path, "photos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.BindEndpoints("http://source", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BindEndpoints("http://source", "http://target"); err != nil {
+		t.Fatal(err)
+	}
+	for _, pair := range [][2]string{{"http://other", "http://target"}, {"http://source", "http://other"}} {
+		if err := st.BindEndpoints(pair[0], pair[1]); err == nil {
+			t.Fatalf("accepted changed endpoint in %v", pair)
+		}
+	}
+	counts, err := st.Counts()
+	if err != nil || counts.Done != 1 {
+		t.Fatalf("lost existing state: %+v err=%v", counts, err)
+	}
+}
+
+func TestReadOnlyStatusCannotCreateOrModifyInventory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.db")
+	if _, err := OpenExisting(path); err == nil {
+		t.Fatal("opened missing database")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("created missing database: %v", err)
+	}
+	db, err := Open(path, "photos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, err = OpenExisting(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SetScanComplete(true); err == nil {
+		t.Fatal("status handle allowed a database write")
+	}
 }

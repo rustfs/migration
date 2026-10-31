@@ -8,6 +8,7 @@ import (
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/rustfs/migration/internal/cluster"
 	"github.com/rustfs/migration/internal/store"
@@ -24,13 +25,9 @@ const batchSize = 500
 // concurrency (workers) applies to copy and diff, not to scan.
 // rate_limit applies to copy body reads only.
 func Run(ctx context.Context, cli *s3.Client, bucket string, st *store.Store) (int64, error) {
-	if err := cluster.HeadBucket(ctx, cli, bucket); err != nil {
+	if err := st.SetScanComplete(false); err != nil {
 		return 0, err
 	}
-
-	p := s3.NewListObjectsV2Paginator(cli, &s3.ListObjectsV2Input{
-		Bucket: awsv2.String(bucket),
-	})
 
 	var total int64
 	start := time.Now()
@@ -48,22 +45,11 @@ func Run(ctx context.Context, cli *s3.Client, bucket string, st *store.Store) (i
 		return nil
 	}
 
-	for p.HasMorePages() {
-		if err := ctx.Err(); err != nil {
-			_ = flush()
-			return total, err
-		}
-		page, err := p.NextPage(ctx)
-		if err != nil {
-			return total, fmt.Errorf("list page: %w", err)
-		}
-		if name := awsv2.ToString(page.Name); name != "" && name != bucket {
-			return total, fmt.Errorf("list page bucket mismatch: requested %q, server returned %q", bucket, name)
-		}
-		for _, obj := range page.Contents {
+	err := cluster.WalkObjects(ctx, cli, bucket, func(objects []types.Object) error {
+		for _, obj := range objects {
 			o := store.Object{
 				Key:  awsv2.ToString(obj.Key),
-				Size: deref(obj.Size),
+				Size: *obj.Size,
 				ETag: awsv2.ToString(obj.ETag),
 			}
 			if obj.LastModified != nil {
@@ -72,22 +58,22 @@ func Run(ctx context.Context, cli *s3.Client, bucket string, st *store.Store) (i
 			buf = append(buf, o)
 			if len(buf) >= batchSize {
 				if err := flush(); err != nil {
-					return total, err
+					return err
 				}
 				log.Printf("scan %s: %d objects (elapsed %s)", bucket, total, time.Since(start).Truncate(time.Second))
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return total, fmt.Errorf("scan %s: %w", bucket, err)
 	}
 	if err := flush(); err != nil {
 		return total, err
 	}
+	if err := st.SetScanComplete(true); err != nil {
+		return total, err
+	}
 	log.Printf("scan %s complete: %d objects in %s", bucket, total, time.Since(start).Truncate(time.Second))
 	return total, nil
-}
-
-func deref(p *int64) int64 {
-	if p == nil {
-		return 0
-	}
-	return *p
 }

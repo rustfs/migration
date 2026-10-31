@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,15 +25,6 @@ import (
 	"github.com/rustfs/migration/internal/store"
 )
 
-var (
-	cfgPath           string
-	bucketFlag        string
-	diffExtra         bool
-	workersFlag       int
-	multipartConcFlag int
-	rateLimitFlag     string
-)
-
 func Execute() error {
 	return NewRoot().Execute()
 }
@@ -43,13 +36,13 @@ func NewRoot() *cobra.Command {
 		Short:         rootShort,
 		Long:          rootLong + exampleFooter,
 		SilenceUsage:  true,
-		SilenceErrors: false,
+		SilenceErrors: true,
 	}
-	root.PersistentFlags().StringVarP(&cfgPath, "config", "c", "config.yaml", "config YAML path / 配置文件路径")
-	root.PersistentFlags().StringVar(&bucketFlag, "bucket", "", "bucket name (empty = all) / 桶名（空=全部）")
-	root.PersistentFlags().IntVar(&workersFlag, "workers", 0, "concurrent objects for run/migrate/diff, overrides YAML (must be >= 1) / 对象并发数，覆盖配置，须 >= 1")
-	root.PersistentFlags().IntVar(&multipartConcFlag, "multipart-concurrency", 0, "parallel parts per large object, overrides YAML (must be >= 1) / 单个大对象的分片并发，覆盖配置，须 >= 1")
-	root.PersistentFlags().StringVar(&rateLimitFlag, "rate-limit", "", "aggregate source-read cap for run/migrate, e.g. 20M or 20MiB; 0 = unlimited / 所有 worker 从源读取的合计上限，例如 20M 或 20MiB；0 表示不限速")
+	root.PersistentFlags().StringP("config", "c", "config.yaml", "config YAML path / 配置文件路径")
+	root.PersistentFlags().String("bucket", "", "bucket name (empty = all) / 桶名（空=全部）")
+	root.PersistentFlags().Int("workers", 0, "concurrent objects for run/migrate/diff, overrides YAML (must be >= 1) / 对象并发数，覆盖配置，须 >= 1")
+	root.PersistentFlags().Int("multipart-concurrency", 0, "parallel parts per large object, overrides YAML (must be >= 1) / 单个大对象的分片并发，覆盖配置，须 >= 1")
+	root.PersistentFlags().String("rate-limit", "", "aggregate source-read cap for run/migrate, e.g. 20M or 20MiB; 0 = unlimited / 所有 worker 从源读取的合计上限，例如 20M 或 20MiB；0 表示不限速")
 	root.CompletionOptions.DisableDefaultCmd = true
 
 	root.AddCommand(listCmd())
@@ -61,27 +54,46 @@ func NewRoot() *cobra.Command {
 	return root
 }
 
-func signalCtx() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
+func signalCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	done := make(chan struct{})
 	go func() {
-		s := <-ch
-		log.Printf("received signal %s, shutting down gracefully... / 收到信号，正在优雅退出（再按一次强制退出）", s)
-		cancel()
-		s = <-ch
-		log.Printf("received second signal %s, forcing exit / 第二次信号，强制退出", s)
-		os.Exit(130)
+		select {
+		case <-done:
+			return
+		case sig := <-ch:
+			log.Printf("received %s, stopping (send another signal to force exit) / 收到信号，正在停止", sig)
+			cancel()
+		}
+		select {
+		case <-done:
+		case <-ch:
+			os.Exit(130)
+		}
 	}()
-	return ctx, cancel
+	return ctx, sync.OnceFunc(func() {
+		signal.Stop(ch)
+		close(done)
+		cancel()
+	})
 }
 
 func loadConfig(cmd *cobra.Command) (*config.Config, error) {
+	flags := cmd.Flags()
+	cfgPath, _ := flags.GetString("config")
+	workersFlag, _ := flags.GetInt("workers")
+	multipartConcFlag, _ := flags.GetInt("multipart-concurrency")
+	rateLimitFlag, _ := flags.GetString("rate-limit")
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return nil, err
 	}
-	cfg.ApplyBucketFlag(bucketFlag)
+	if flags.Changed("bucket") {
+		bucket, _ := flags.GetString("bucket")
+		cfg.ApplyBucketFlag(bucket)
+	}
 	if err := cfg.ValidateNames(); err != nil {
 		return nil, err
 	}
@@ -112,7 +124,7 @@ func listCmd() *cobra.Command {
 			if err := cfg.ValidateSource(); err != nil {
 				return err
 			}
-			ctx, cancel := signalCtx()
+			ctx, cancel := signalCtx(cmd.Context())
 			defer cancel()
 			oldCli, err := s3client.NewWithPool(ctx, cfg.Old, cfg.MaxInFlight())
 			if err != nil {
@@ -169,7 +181,7 @@ func scanCmd() *cobra.Command {
 			if err := cfg.ValidateSource(); err != nil {
 				return err
 			}
-			ctx, cancel := signalCtx()
+			ctx, cancel := signalCtx(cmd.Context())
 			defer cancel()
 			oldCli, err := s3client.NewWithPool(ctx, cfg.Old, cfg.MaxInFlight())
 			if err != nil {
@@ -206,6 +218,7 @@ func migrateCmd() *cobra.Command {
 }
 
 func diffCmd() *cobra.Command {
+	var diffExtra bool
 	c := &cobra.Command{
 		Use:   "diff",
 		Short: diffShort,
@@ -253,22 +266,13 @@ func statusCmd() *cobra.Command {
 			}
 			fmt.Printf("%-30s %9s %9s %9s %9s %9s %9s\n",
 				"BUCKET", "TOTAL", "PENDING", "DONE", "CONFLICT", "SKIPPED", "FAILED")
-			for _, t := range targets {
-				st, err := store.Open(t.path, t.bucket)
-				if err != nil {
-					fmt.Printf("%s: %v\n", t.bucket, err)
-					continue
+			var errs []error
+			for _, path := range targets {
+				if err := printStatus(path, cfg.Bucket); err != nil {
+					errs = append(errs, fmt.Errorf("%s: %w", path, err))
 				}
-				c, err := st.Counts()
-				_ = st.Close()
-				if err != nil {
-					fmt.Printf("%s: %v\n", t.bucket, err)
-					continue
-				}
-				fmt.Printf("%-30s %9d %9d %9d %9d %9d %9d\n",
-					truncate(t.bucket, 30), c.Total, c.Pending, c.Done, c.Conflict, c.Skipped, c.Failed)
 			}
-			return nil
+			return errors.Join(errs...)
 		},
 	}
 }
@@ -285,7 +289,7 @@ func forEachBucket(cmd *cobra.Command, needTarget bool, fn func(ctx context.Cont
 	} else if err := cfg.ValidateSource(); err != nil {
 		return err
 	}
-	ctx, cancel := signalCtx()
+	ctx, cancel := signalCtx(cmd.Context())
 	defer cancel()
 	pool := cfg.MaxInFlight()
 	oldCli, err := s3client.NewWithPool(ctx, cfg.Old, pool)
@@ -331,9 +335,10 @@ func resolveBuckets(ctx context.Context, cfg *config.Config, oldCli *s3.Client) 
 	}
 	names := make([]string, 0, len(list))
 	for _, b := range list {
-		if b.Name != "" {
-			names = append(names, b.Name)
+		if err := config.ValidateBucketName(b.Name); err != nil {
+			return nil, fmt.Errorf("list source buckets: %w", err)
 		}
+		names = append(names, b.Name)
 	}
 	if len(names) == 0 {
 		return nil, fmt.Errorf("source instance has no buckets / 源集群没有桶")
@@ -342,28 +347,44 @@ func resolveBuckets(ctx context.Context, cfg *config.Config, oldCli *s3.Client) 
 }
 
 func scanOne(ctx context.Context, cfg *config.Config, oldCli *s3.Client, bucket string) error {
+	if err := cluster.HeadBucket(ctx, oldCli, bucket); err != nil {
+		return err
+	}
 	st, err := store.Open(cfg.DBPathFor(bucket), bucket)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	if err := st.BindEndpoints(cfg.Old.Endpoint, ""); err != nil {
+		return err
+	}
 	log.Printf("scan: bucket=%s db=%s (single-threaded list; --workers applies to copy and diff)", bucket, cfg.DBPathFor(bucket))
 	_, err = scanner.Run(ctx, oldCli, bucket, st)
 	return err
 }
 
 func migrateOne(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error {
-	if err := cluster.HeadBucket(ctx, oldCli, bucket); err != nil {
-		return err
-	}
-	if err := cluster.EnsureBucket(ctx, newCli, bucket); err != nil {
-		return err
-	}
-	st, err := store.Open(cfg.DBPathFor(bucket), bucket)
+	st, err := store.OpenInventory(cfg.DBPathFor(bucket), bucket)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	if err := cluster.HeadBucket(ctx, oldCli, bucket); err != nil {
+		return err
+	}
+	targetErr := cluster.HeadBucket(ctx, newCli, bucket)
+	if targetErr != nil && !s3client.IsNotFound(targetErr) {
+		return targetErr
+	}
+	// Bind after the endpoints respond, but before creating anything on the target.
+	if err := st.BindEndpoints(cfg.Old.Endpoint, cfg.New.Endpoint); err != nil {
+		return err
+	}
+	if targetErr != nil {
+		if err := cluster.CreateBucket(ctx, newCli, bucket); err != nil {
+			return err
+		}
+	}
 	m, err := migrator.NewForBucket(cfg, bucket, oldCli, newCli, st)
 	if err != nil {
 		return err
@@ -374,58 +395,56 @@ func migrateOne(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Clie
 	return m.Run(ctx)
 }
 
-type dbTarget struct {
-	bucket string
-	path   string
+func printStatus(path, requested string) error {
+	st, err := store.OpenExisting(path)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	bucket, err := st.BoundBucket()
+	if err != nil {
+		return err
+	}
+	if requested != "" && requested != bucket {
+		return fmt.Errorf("db_path is bound to bucket %q but config requests %q", bucket, requested)
+	}
+	c, err := st.Counts()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%-30s %9d %9d %9d %9d %9d %9d\n",
+		truncate(bucket, 30), c.Total, c.Pending, c.Done, c.Conflict, c.Skipped, c.Failed)
+	return nil
 }
 
-func statusTargets(cfg *config.Config) ([]dbTarget, error) {
+func statusTargets(cfg *config.Config) ([]string, error) {
+	base := filepath.Clean(cfg.DBPath)
+	var paths []string
+	if _, err := os.Stat(base); err == nil {
+		paths = append(paths, base)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
 	if !cfg.AllBuckets() {
-		return []dbTarget{{bucket: cfg.Bucket, path: cfg.DBPath}}, nil
+		return paths, nil
 	}
-	dir := filepath.Dir(cfg.DBPath)
-	if dir == "" {
-		dir = "."
+	dir := filepath.Dir(base)
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return paths, nil
 	}
-	matches, err := filepath.Glob(filepath.Join(dir, "migration-*.db"))
 	if err != nil {
 		return nil, err
 	}
-	var out []dbTarget
-	for _, p := range matches {
-		if st, err := store.OpenExisting(p); err == nil {
-			name, berr := st.BoundBucket()
-			_ = st.Close()
-			if berr == nil && name != "" {
-				out = append(out, dbTarget{bucket: name, path: p})
-				continue
-			}
-		}
-		base := filepath.Base(p)
-		name := strings.TrimSuffix(strings.TrimPrefix(base, "migration-"), ".db")
-		if name != "" {
-			out = append(out, dbTarget{bucket: name, path: p})
-		}
-	}
-	if _, err := os.Stat(cfg.DBPath); err == nil {
-		if st, err := store.OpenExisting(cfg.DBPath); err == nil {
-			name, berr := st.BoundBucket()
-			_ = st.Close()
-			if berr == nil && name != "" {
-				dup := false
-				for _, t := range out {
-					if t.path == cfg.DBPath {
-						dup = true
-						break
-					}
-				}
-				if !dup {
-					out = append(out, dbTarget{bucket: name, path: cfg.DBPath})
-				}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() && strings.HasPrefix(name, "migration-") && strings.HasSuffix(name, ".db") {
+			if path := filepath.Join(dir, name); path != base {
+				paths = append(paths, path)
 			}
 		}
 	}
-	return out, nil
+	return paths, nil
 }
 
 func truncate(s string, max int) string {
