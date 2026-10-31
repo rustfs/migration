@@ -1,82 +1,54 @@
-# migration — English usage notes
+# Running a migration
 
-The English operator guide is the [README](../README.md): install, configuration, workflows, tuning, safety, and exit codes. The same guide is in the repository as [简体中文](../README_ZH.md), [Deutsch](../README_DE.md), [Español](../README_ES.md), [français](../README_FR.md), [日本語](../README_JA.md), [한국어](../README_KO.md), [Portuguese](../README_PT.md), and [Русский](../README_RU.md).
+Use `run` for the first transfer and `diff` for an independent check of the destination. The full operator guide covers installation, permissions, configuration, concurrency and troubleshooting. [English guide](../README.md) · [中文使用手册](使用手册.md)
 
-This page is the short English companion, so the rules that are easy to get wrong stay next to the commands.
-
-The longer Chinese handbook is [使用手册.md](./使用手册.md). Architecture and constraints are in [DESIGN.md](./DESIGN.md).
+Copy `config.example.yaml` to `config.yaml`. Set `old` to the source and `new` to the destination. The destination must honor `If-None-Match: *` on both `PutObject` and `CompleteMultipartUpload`. This protects an object created by another writer between the initial check and the upload.
 
 ```bash
-cp config.example.yaml config.yaml
-./bin/migration --help
-./bin/migration run  -c config.yaml --workers 16 --rate-limit 20M
-./bin/migration diff -c config.yaml
+./bin/migration list   -c config.yaml
+./bin/migration run    -c config.yaml --bucket photos --rate-limit 20M
+./bin/migration status -c config.yaml --bucket photos
+./bin/migration diff   -c config.yaml --bucket photos
 ```
 
-An empty `bucket:` migrates every source bucket. `--bucket NAME` pins one. `run` is scan plus copy. `scan` and `migrate` remain available on their own.
+Omit `--bucket photos` and leave `bucket` empty in the configuration to process every source bucket. An explicit `--bucket ""` also selects all buckets. Keep the bucket selection and the state directory the same when resuming. For a single bucket the tool uses `db_path`. All-bucket mode uses `migration-<bucket>.db` files alongside `db_path`.
 
-## Commands
+The source account must be able to list and read the selected bucket. The destination account needs permission to check keys and write objects, including multipart uploads and aborts. On Amazon S3, `s3:ListBucket` lets a HEAD request distinguish a missing key (404) from a permission error (403). The tool treats a permission error as a failure. [S3 HEAD permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html)
 
-| Command | Effect |
+## Pick a command
+
+| Command | When to use it |
 | --- | --- |
-| `list` | List source buckets. Read-only |
-| `run` | Scan, then copy. The command to use |
-| `scan` | Inventory into SQLite. Single-threaded. Does not write to the target |
-| `migrate` | Copy `pending` and `failed` rows only |
-| `status` | Local counters. No S3 calls |
-| `diff` | List the source live and `HEAD` the target. Exits 1 on a gap. Never uploads |
-| `diff --extra` | Also list keys that exist only on the target. Those keys are not a failure |
+| `list` | Check which buckets the source account can list. |
+| `scan` | Save a full inventory in SQLite before you start copying. The source is read sequentially, one listing page at a time. |
+| `migrate` | Copy the `pending` and `failed` rows from an existing inventory. If a scan failed or was interrupted, complete another scan first. |
+| `run` | Scan and copy in one command. Run it again to pick up keys added since the previous scan. |
+| `status` | Read object counts from the local state files. This does not contact S3. |
+| `diff` | Check which source keys are missing or have different sizes or comparable ETags at the destination. |
+| `diff --extra` | Also list keys found only at the destination. These do not make the command fail. |
 
-Shared flags: `-c/--config` (default `config.yaml`), `--bucket`, `--workers`, `--multipart-concurrency`, `--rate-limit`. Help text is bilingual. Full flag and workflow detail is in the [README](../README.md#commands).
+## Resume a transfer
 
-## Knobs
+After an interruption during copying, run `migrate` again. It checks existing keys before writing. A matching size and identical nonempty ETags mark an existing object `done`. Any other existing object is recorded as `conflict` and preserved. Even identical multipart content can have different ETags when the part sizes differ, so review conflicts left by an interrupted upload. If the source has changed since the inventory was built, use `run` to refresh the inventory before retrying.
 
-Priority is **CLI > environment > YAML > default**.
+Inspect `last_error` on `failed` rows. A confirmed missing source key is `skipped` and can be picked up if it reappears on a later scan. Both `done` and `conflict` are terminal. If an object was subsequently removed from the destination, start a new inventory in a separate state directory to reconsider it. A database belongs to one bucket and one pair of endpoints. Confirm the cluster addresses before opening a database created by an older version.
 
-| Knob | Flag | Env | Default | Applies to |
-| --- | --- | --- | --- | --- |
-| Object workers | `--workers` | `WORKERS` | 16 | Copy in `run` / `migrate`, and HEAD in `diff` |
-| Parts of one large object | `--multipart-concurrency` | `MULTIPART_CONCURRENCY` | 4 | Multipart upload inside `run` / `migrate` |
-| Aggregate source read | `--rate-limit` | `RATE_LIMIT` | unlimited | Object bodies in `run` / `migrate` |
+`diff` reads current listings and object headers independently of the inventory. Its `size_only` counter is included in `ok` and identifies objects for which only the size could be checked. For an empty source bucket, `diff` checks that the destination bucket exists. A missing destination bucket also yields exit code 1. A byte-for-byte audit requires reading object bodies separately.
 
-`scan` stays single-threaded: `ListObjectsV2` is sequential, and the rows go into one SQLite file. `--workers` does not speed it up, and `rate_limit` does not apply to `scan`, `diff`, `list`, or `status`.
+## Set concurrency and bandwidth
 
-Peak in-flight requests per cluster are about `workers × multipart_concurrency`. The byte cap does not lower that product. A proxy 503 is a concurrency problem: lower `workers` first, then `multipart_concurrency` for large objects. The default `16 × 4` can fill HAProxy `maxconn` even when `rate_limit` is set.
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `--workers` / `WORKERS` | 16 | Concurrent copies, or concurrent HEAD requests for `diff` |
+| `--multipart-concurrency` / `MULTIPART_CONCURRENCY` | 4 | Concurrent parts per large object |
+| `--rate-limit` / `RATE_LIMIT` | Unlimited | Combined bandwidth for reading source object bodies |
 
-Zero is not one rule:
+The CLI takes precedence over the environment, which takes precedence over YAML. In YAML, setting either concurrency value to zero selects its default. On the command line and in the environment, concurrency must be at least one. A zero rate limit always means unlimited. `20M` means 20,000,000 bytes/s and `20MiB` means 20,971,520 bytes/s. Uploads consume bandwidth in addition to source reads. [Configuration and tuning](../README.md#concurrency)
 
-- YAML `workers: 0` or an omitted field means 16. The same for `multipart_concurrency` means 4. A negative value is an error.
-- `WORKERS=0`, `MULTIPART_CONCURRENCY=0`, `--workers 0`, and `--multipart-concurrency 0` are errors. An explicit zero does not fall back to the default.
-- `rate_limit: 0`, `RATE_LIMIT=0`, and `--rate-limit 0` are unlimited at every layer.
-
-`20M` and `20MB` are decimal: 20×1000×1000 bytes/s. `20Mi` and `20MiB` are binary: 20×1024×1024 bytes/s. `30M` and `50M` follow the decimal rule. A bare number is bytes/s. A trailing `/s` is ignored. Case does not matter.
-
-`multipart_part_size` must be at least 5 MiB (5242880). A smaller value fails at config load and is not raised. The 16 MiB default is unchanged. Past 10,000 parts, the tool grows the part size for that object.
-
-To protect a production source, start with `--rate-limit 20M` (or `30M` / `50M`) and watch `migration status` plus the NIC. `status` does not call S3. Lighter starting point while you watch:
-
-```yaml
-workers: 2
-multipart_concurrency: 2
-rate_limit: 20M
-```
-
-Tuning ranges, the unit table, and spool-disk notes are in the README under [Concurrency](../README.md#concurrency) and [Rate limit](../README.md#rate-limit).
-
-## Safety rules that the resume path depends on
-
-- Never overwrites. Never deletes. There is no overwrite mode to turn on.
-- A target object that already matches the inventory is `done`, not `conflict`. Size must match. ETags are compared only when both sides have one and neither is a multipart ETag (`hash-N`, any value containing `-`). A different size or a comparable ETag is a conflict and is never overwritten. A Ctrl-C after a successful PUT therefore resumes as `done` when the bytes match, instead of a false conflict.
-- `skipped` is only a source 404 / `NoSuchKey` from a request that finished. `context.Canceled`, `context.DeadlineExceeded`, and `request canceled` are `failed` (the next `migrate` retries them), even when the error text also contains `NotFound` or `StatusCode: 404`.
-- The first Ctrl-C cancels the pool and aborts an in-flight multipart upload without deleting a committed object. For a single bucket, that stop during the copy phase exits 0. A second signal exits 130.
-- `done` and `conflict` are terminal across a later scan. `pending`, `failed`, and `skipped` are refreshed and set back to `pending`. `ListObjectsV2` cannot filter by modification time, so a catch-up is a full list plus `migrate`.
-
-State, `diff` output, the conflict-log format, and the FAQ are in the README: [Resume and object state](../README.md#resume-and-object-state), [diff](../README.md#checking-the-target-with-diff), [Troubleshooting](../README.md#troubleshooting).
-
-## Exit codes
+## Exit status
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Success. A single-bucket copy also exits 0 on the first Ctrl-C. Unfinished rows stay in SQLite |
-| 1 | Bad config, a remote error, a failed bucket, a `diff` gap, Ctrl-C during scan, or an interrupt across more than one bucket |
-| 130 | Second `SIGINT` or `SIGTERM` |
+| 0 | The command completed. Check `conflict` and `skipped` counts for objects that may need attention. |
+| 1 | The operation failed or was interrupted, at least one copy failed, or `diff` found missing or mismatched keys. |
+| 130 | A second interrupt forced an immediate exit. |

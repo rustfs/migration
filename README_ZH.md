@@ -1,81 +1,55 @@
 # migration
 
-<p align="center">
-  <a href="https://github.com/rustfs/migration/blob/main/README.md">English</a> | 简体中文 |
-  <a href="https://github.com/rustfs/migration/blob/main/README_DE.md">Deutsch</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_ES.md">Español</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_FR.md">français</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_JA.md">日本語</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_KO.md">한국어</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_PT.md">Portuguese</a> |
-  <a href="https://github.com/rustfs/migration/blob/main/README_RU.md">Русский</a>
-</p>
+[English](README.md) | **简体中文** | [Deutsch](README_DE.md) | [Español](README_ES.md) | [Français](README_FR.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | [Português](README_PT.md) | [Русский](README_RU.md)
 
-`migration` 在两个 S3 兼容集群之间做单向对象复制。面向自建 RustFS、MinIO，以及其它讲 S3 API 的端点。请求一律用 path-style，这是这类集群的常见访问方式。
+`migration` 用于将当前对象从一个兼容 S3 的集群复制到另一个集群。例如，业务已切换到新集群写入，但仍需从旧的 RustFS 或 MinIO 集群补齐历史数据。配置中的 `old` 为源集群，`new` 为目标集群，两端均采用路径式寻址。
 
-它可以和在线业务一起跑。凡是会写目标的命令，都遵守三条规则：
+工具会补齐缺失的对象，将同名冲突记入 `conflict.log`，并用本地 SQLite 数据库保存进度。迁移不会删除对象。目标端的 `PutObject` 和 `CompleteMultipartUpload` 都必须支持 `If-None-Match: *` 条件写入。这样，即使业务在迁移检查之后才写入同名对象，也能保留该对象。
 
-- **永不覆盖。** 写入之前先对目标做 `HeadObject`。与清单一致就记为已完成。不一致只写日志，目标上的对象保持原样。
-- **永不删除。** 没有 `DeleteObject`。中止分片上传只放弃这次未完成的上传，不会删除已经提交的对象。
-- **可断点续传。** 每个对象在本地 SQLite 里有一行。停下再跑，已经完成的工作不会重做。
+除当前对象的内容外，还会复制 `Content-Type`、`Cache-Control`、`Content-Disposition`、`Content-Encoding`、`Content-Language`、`Expires` 和 `x-amz-meta-*` 用户元数据。版本历史、删除标记、对象锁、桶策略和生命周期规则不在迁移范围内。
 
-常见布局是：旧集群还留着历史数据，新集群接收全部写入，应用已经对两边做读。本工具把目标上还没有的 key 补过去，不会用源上更旧的内容盖掉目标上更新的对象。同名冲突在这种布局里是预期现象。看 `conflict.log`，手工处理。
+## 延伸阅读
 
-复制的是当前对象，以及 `Content-Type`、`Cache-Control`、`Content-Disposition`、`Content-Encoding`、`Content-Language`、`Expires` 和 `x-amz-meta-*` 用户元数据。版本历史、删除标记、Object Lock、桶策略、生命周期规则都留在原地。
-
-配置文件里，来源是 `old`，目标是 `new`。
-
-## 文档
-
-| 文档 | 内容 |
-| --- | --- |
-| 本文件 | 中文安装、配置、命令、调参和安全说明 |
-| [README.md](README.md) | English，同一结构 |
-| [README_DE.md](README_DE.md) | Deutsch |
-| [README_FR.md](README_FR.md) | français |
-| [README_JA.md](README_JA.md) | 日本語 |
-| [README_ES.md](README_ES.md) | Español |
-| [README_KO.md](README_KO.md) | 한국어 |
-| [README_PT.md](README_PT.md) | Portuguese |
-| [README_RU.md](README_RU.md) | Русский |
-| [docs/USAGE.md](docs/USAGE.md) | 英文短说明 |
-| [docs/使用手册.md](docs/使用手册.md) | 更细的中文手册 |
-| [docs/DESIGN.md](docs/DESIGN.md) | 架构和不会放松的约束 |
-
-`migration --help` 和 `migration <command> --help` 打印中英双语帮助。
+[中文使用手册](docs/使用手册.md) · [英文命令速查](docs/USAGE.md) · [设计说明（英文）](docs/DESIGN.md)
 
 ## 快速开始
 
-需要 Go 1.22 或更高版本。SQLite 是纯 Go 实现，编译不需要 CGO。
+以下命令在仓库根目录运行，需要 Go 1.22 或更高版本。复制配置模板后，请先编辑 `config.yaml`，填入两端的地址和凭据。
 
 ```bash
 git clone https://github.com/rustfs/migration.git
 cd migration
-cp config.example.yaml config.yaml   # 填写来源和目标的地址、密钥
 CGO_ENABLED=0 go build -o bin/migration .
 # 或：make build
+cp config.example.yaml config.yaml   # 填写来源和目标的地址、密钥
+```
 
+```bash
 ./bin/migration list   -c config.yaml
 ./bin/migration run    -c config.yaml --workers 16 --rate-limit 20M
 ./bin/migration status -c config.yaml
 ./bin/migration diff   -c config.yaml
 ```
 
-`bucket:` 留空会迁移来源上的每一个桶。写成 `bucket: photos`，或加上 `--bucket photos`，就只迁这一个桶。
+`bucket:` 留空会迁移源集群中的所有桶。写成 `bucket: photos`，或加上 `--bucket photos`，就只迁这一个桶。
 
-`20M` 是十进制兆字节每秒：20×1000×1000 字节/秒。在共享网络上调高之前，先看 [限速](#rate-limit)。
+即使 YAML 或 `BUCKET` 已指定某个桶，也可以用 `--bucket ""` 选择源端的全部桶。
 
-## 安装编译
+`--rate-limit 20M` 表示所有任务合计每秒最多从源端读取 20,000,000 字节。二进制单位及适用范围见[限速](#rate-limit)。
+
+## 使用预编译包
+
+打开 [Build packages](https://github.com/rustfs/migration/actions/workflows/packages.yml)，在成功运行的 **Artifacts** 中选择对应平台。解压下载文件，用随附的 SHA-256 校验值核对软件包，再解开软件包。Linux amd64 和 arm64 使用 `.tar.gz`，Windows amd64 使用 `.zip`，可执行文件为 `migration.exe`。
 
 ```bash
-git clone https://github.com/rustfs/migration.git
-cd migration
-CGO_ENABLED=0 go build -o bin/migration .
+./migration --version
 ```
 
-`make build` 跑的是同一条命令。产物是静态二进制 `bin/migration`。`make test` 即 `go test ./...`。
+```powershell
+.\migration.exe --version
+```
 
-保护好 `config.yaml`（`chmod 600` 是合理默认）。进程会记录端点和对象 key，不会记录密钥。
+`config.yaml` 包含访问密钥。在 Linux 上可执行 `chmod 600 config.yaml`，仅允许文件所有者读写。运行日志会记录端点和对象键。
 
 ## 配置
 
@@ -83,7 +57,7 @@ CGO_ENABLED=0 go build -o bin/migration .
 cp config.example.yaml config.yaml
 ```
 
-最少要填两边的地址、Access Key、Secret Key。目标上还没有该桶时，目标密钥需要 `s3:CreateBucket`。已经存在的目标桶不会被修改。
+分别填写两端的 HTTP 或 HTTPS 地址，并在凭据字段中填写访问密钥。端点 URL 不可包含凭据、查询参数或片段。如果需要在目标端创建桶，目标账户还需具备 `s3:CreateBucket` 权限。
 
 ```yaml
 old:                              # 来源，只读
@@ -97,7 +71,7 @@ new:                              # 目标，读 + 写
   secret_key: "NEW_SK"
   region: "us-east-1"
 
-bucket: ""                        # 空 = 来源上的每一个桶
+bucket: ""                        # 空 = 源集群中的所有桶
 db_path: "./migration.db"
 conflict_log: "./conflict.log"
 spool_dir: ""                     # 小对象临时目录，默认跟 db 同目录
@@ -109,7 +83,7 @@ multipart_concurrency: 4          # 单个大对象的分片并发；0 或省略
 rate_limit: 0                     # 源读取合计上限；0 或省略 = 不限速
 ```
 
-`list` 和 `scan` 只需要来源地址和密钥。`run`、`migrate`、`diff` 两边都要。
+`list` 和 `scan` 只需要源端的地址和凭据。`run`、`migrate` 和 `diff` 需要两端的地址和凭据。
 
 ### 优先级
 
@@ -148,19 +122,19 @@ rate_limit: 0                     # 源读取合计上限；0 或省略 = 不限
 
 并发或大小写成负数，启动即失败。`WORKERS` 和 `MULTIPART_CONCURRENCY` 必须是纯整数。单位只写在 `RATE_LIMIT` 上：`RATE_LIMIT=20M` 合法，`WORKERS=20M` 不合法。
 
-`multipart_part_size` 至少 5 MiB（5242880）。S3 会用 `EntityTooSmall` 拒绝更小的非末片。写得更小会在加载配置时失败，不会被悄悄抬高。单个对象的分片数要超过 10000 时，工具会加大该对象的分片，使上传能够完成。
+`multipart_part_size` 的取值范围为 5 MiB 至 5 GiB，默认 16 MiB。超过 5 GiB 的对象始终使用分片上传。每个对象最多拆为 10,000 片，必要时工具会自动增大分片。如果仍需单片超过 5 GiB，迁移会报错。
 
-桶名不能包含空白或 `/`。
+桶名不能包含空白、控制字符、路径分隔符及 Windows 文件名中的保留符号，也不能是 `.` 或 `..`。
 
 ### 环境变量
 
-设了的变量覆盖 YAML。没设的变量不动文件里的值。
+环境变量非空时覆盖 YAML 中的对应设置。
 
 | 变量 | 覆盖 |
 | --- | --- |
 | `OLD_ENDPOINT` `OLD_AK` `OLD_SK` `OLD_REGION` | 来源端点 |
 | `NEW_ENDPOINT` `NEW_AK` `NEW_SK` `NEW_REGION` | 目标端点 |
-| `REGION` | 在上述专用变量之后仍然为空的那一侧 region |
+| `REGION` | 为尚未配置区域的端点提供默认值 |
 | `BUCKET` | `bucket` |
 | `DB_PATH` `CONFLICT_LOG` `SPOOL_DIR` | 本地路径 |
 | `WORKERS` `MULTIPART_CONCURRENCY` | 并发（整数 ≥ 1） |
@@ -181,7 +155,7 @@ rate_limit: 0                     # 源读取合计上限；0 或省略 = 不限
 | `migration scan -c config.yaml` | 把源清单写入 SQLite | 否 | 单线程。不限速 |
 | `migration migrate -c config.yaml` | 只复制 SQLite 里 `pending` 或 `failed` 的行 | 是，但不覆盖 | `workers`、`multipart_concurrency` 和 `rate_limit` |
 | `migration status -c config.yaml` | 打印本地计数 | 否 | 无。不访问 S3 |
-| `migration diff -c config.yaml` | 列出源并对目标每个 key 做 `HEAD` | 否 | `workers` 控制并行 HEAD。不限速 |
+| `migration diff -c config.yaml` | 列举源端对象，逐个在目标端执行 `HEAD` | 否 | `workers` 控制并行 HEAD。不限速 |
 | `migration diff --extra -c config.yaml` | 同上，并列出只在目标上的 key | 否 | `workers` |
 
 所有命令共用的参数：
@@ -214,11 +188,11 @@ rate_limit: 0                     # 源读取合计上限；0 或省略 = 不限
 对每个桶，`run` 会：
 
 1. 对来源做 `HeadBucket`。
-2. 目标上没有该桶就创建。已有的桶不动。
-3. 对来源做 `ListObjectsV2`，写入 SQLite。这一步是单线程。
-4. 启动 `workers` 个复制协程。每个对象先对目标做 `HeadObject`。缺失的 key 从来源读出、写到目标。这些源读取共用 `rate_limit`。已经与清单一致的 key 记为 `done`，不再上传。存在但不一致的 key 追加到冲突日志，不覆盖。
-5. 大小达到或超过 `multipart_threshold` 的对象，用 `multipart_concurrency` 上传分片。这些分片共用同一个字节上限。
-6. 核对目标上的大小。单分片对象在 ETag 可比时再比 ETag。见 [对象状态](#resume-and-object-state)。
+2. 对来源做 `ListObjectsV2`，写入 SQLite。这一步是单线程。
+3. 目标上没有该桶就创建。已有的桶不动。
+4. 最多同时复制 `workers` 个对象。如果业务恰好在目标检查后创建同名对象，条件写入会保护该对象。工具会重新核对目标，将结果记为 `done` 或 `conflict`。
+5. 对象大小达到 `multipart_threshold` 时采用分片上传。每个对象最多并行传输 `multipart_concurrency` 个分片，所有源端读取共享同一带宽上限。
+6. 核对目标上的大小。普通上传的对象在 ETag 可比时再比 ETag。见 [对象状态](#resume-and-object-state)。
 
 桶按顺序迁移，所以 `rate_limit` 就是整个进程的上限。
 
@@ -231,7 +205,7 @@ rate_limit: 0                     # 源读取合计上限；0 或省略 = 不限
 
 ### 源上后来写入的对象
 
-`ListObjectsV2` 不能在服务端按修改时间过滤。补拷就是再列一遍全量清单。新 key 变成 `pending`。再次被列出的 `failed` 或 `skipped` 行回到 `pending`。`done` 和 `conflict` 保持不变，所以第二遍不会重传，也不会覆盖目标。
+`ListObjectsV2` 不能在服务端按修改时间过滤。要补齐新增对象，需要重新列举整个源桶。新发现的对象会标记为 `pending`。再次被列出的 `failed` 或 `skipped` 行回到 `pending`。`done` 和 `conflict` 保持不变，所以第二遍不会重传，也不会覆盖目标。
 
 ```bash
 ./bin/migration scan    -c config.yaml
@@ -241,7 +215,7 @@ rate_limit: 0                     # 源读取合计上限；0 或省略 = 不限
 
 再跑一次 `run` 就是把这两步合成一条命令。
 
-### 先盘点再复制
+### 先建立清单，再复制
 
 ```bash
 ./bin/migration scan   -c config.yaml
@@ -251,15 +225,9 @@ rate_limit: 0                     # 源读取合计上限；0 或省略 = 不限
 
 ## 并发
 
-三个旋钮，管的事情不一样：
+用 `workers` 调整同时复制的对象数。大对象还可以通过 `multipart_concurrency` 控制每个对象并行读写的分片数。默认配置为 16 个对象、每个对象 4 个分片，同时发往单个集群的请求最多约 64 个。请根据磁盘、代理和可用内存选择并发数。
 
-| 旋钮 | 限制什么 | 何时加大 | 何时减小 |
-| --- | --- | --- | --- |
-| `workers` / `--workers` | 同时在飞的**对象**数。也是 `diff` 的 HEAD 并行度 | 以小对象为主，CPU、磁盘和代理都还有余量 | 出现 503、超时、源盘打满，或要排查单个对象（`--workers 1`） |
-| `multipart_concurrency` / `--multipart-concurrency` | **一个大对象里面**同时上传多少个分片 | 单个对象很大，这条流还能再用一些带宽 | 大对象已经占满链路，或几个大对象叠在一起把代理打满 |
-| `rate_limit` / `--rate-limit` | 所有这些 worker **合计**每秒能从源读多少字节 | 源和网络还有余量 | 生产还在用源集群或同一块网卡。从 `20M` 起，再试 `30M` 或 `50M` |
-
-`scan` 不用 `workers`，也不吃 `rate_limit`。列目录必须一页接一页，因为每一页都要上一页的 continuation token，而且行要写进同一个 SQLite 文件。扫描慢，加大 `--workers` 没有用。`list`、`diff`、`status` 不读对象正文，所以字节上限对它们不起作用。`diff` 会用 `--workers` 做 HEAD。
+扫描必须等到上一页返回续传令牌后才能请求下一页，因此增大 `--workers` 无法加快扫描。`rate_limit` 只限制复制时从源端读取的对象数据，对 `scan`、`list`、`diff` 和 `status` 均不生效。
 
 ```text
 workers = 4 个对象同时复制
@@ -269,40 +237,34 @@ workers = 4 个对象同时复制
   对象 D（大文件）  ── 同上
 ```
 
-打到同一个集群的在途请求峰值大约是 `workers × multipart_concurrency`。小对象只占一路。达到分片阈值的对象会按分片并发乘上去。默认 `16 × 4` 是 64。HAProxy 或 Nginx 的 `maxconn`，以及两边的磁盘，都要撑得住这个乘积。
+每个正在传输的分片需要在内存中缓存，任务队列最多保留 2,048 个对象描述。HTTP 客户端可复用连接，每个主机最多保留 1,024 条空闲连接。
 
-HTTP 客户端会把每个主机的空闲连接数提高到这个乘积（上限 1024），用来替代 Go 默认的每主机 2 条空闲连接。这是连接复用。真正限制在途工作的是 worker 池和分片信号量。等待队列最多 2048 个对象描述，所以把 `--workers` 开得很大也不会把整桶清单堆进内存。
-
-经验起点：
+可按负载选择初始值，再根据实际吞吐量调整。
 
 | 负载 | 建议 |
 | --- | --- |
 | 大量小对象（KB 到几 MB），链路有余量 | `workers` 16–64，`multipart_concurrency` 保持 4 |
 | 大小混合 | `workers` 8–32，`multipart_concurrency` 4–8 |
 | 少量超大对象 | `workers` 2–8，`multipart_concurrency` 4–16 |
-| 单个对象失败，日志不好对 | `--workers 1` |
+| 需要排查单个对象的错误 | `--workers 1` |
 | 代理返回 503、大量超时，或源盘打满 | 先减 `workers`。慢的是大对象时，再减 `multipart_concurrency` |
 | 给生产留带宽 | `--rate-limit 20M`，源看起来正常后再试 `30M` 或 `50M`。`0` 取消限额 |
 | 小对象想更快 | 加大 `workers` |
 | 单个大对象想更快 | 加大 `multipart_concurrency`，或减小 `multipart_part_size`（字节，最小 5 MiB） |
 
-复制过程中大约每 10 秒打一行进度：processed、copied、conflicts、skipped、failed、bytes。
+复制过程中，日志约每 10 秒输出一次进度，包括处理数、完成数、冲突数、跳过数、失败数和字节数。
 
-每个正在复制的小对象在 `spool_dir` 里占一个临时文件，最大约等于 `multipart_threshold`，因为 `PutObject` 需要可 seek 的 body。`/tmp` 如果是内存盘，把 `spool_dir` 指到真实磁盘。`workers` 越大，同时存在的临时文件越多。
+每个正在复制的小对象在 `spool_dir` 里占一个临时文件，最大约等于 `multipart_threshold`，因为 `PutObject` 需要可回读的请求体。`/tmp` 如果是内存盘，把 `spool_dir` 指到真实磁盘。`workers` 越大，同时存在的临时文件越多。
 
-一个数据库文件只跑一个进程。SQLite 以 WAL 打开，进程内只用一条连接，所以状态更新是串行的，对象字节仍走 worker 池。第二个进程写同一个文件仍会报 `database is locked`。
+每份状态库应只供一个迁移进程写入。进程通过一条 SQLite 连接按顺序更新状态，对象数据仍可并行传输。多个进程同时写入同一文件可能出现 `database is locked`。
 
 <a id="rate-limit"></a>
 
 ## 限速
 
-`rate_limit` 是所有复制 worker 共用的一个令牌桶，包括同一个大对象里的分片。它统计的是从源读出的对象正文字节。List、HEAD 和写前冲突检查不计入。读完之后的上传也不再计一次。
+所有复制任务及其分片共用 `rate_limit` 设置的源端读取带宽。列举对象、获取响应头和向目标上传不计入这个额度。
 
-小对象按限额从来源读完，再写到目标。源侧读取不超过限额。随后的写入可能短时更快。迁移机如果和业务共用网卡，写入还会再占一段带宽。希望网卡总占用停在大约 40 MB/s 附近时，从 `20M` 开始。
-
-限额只让复制变慢。它不覆盖，也不删除。已经与清单一致的对象仍然跳过。第一次 Ctrl-C 会取消正在等令牌的读取。没传完的对象留在 SQLite 里，下次 `migrate` 继续。
-
-限额不减少在途请求数。代理返回 503 仍然是并发问题：先减 `workers`，再减 `multipart_concurrency`。
+小对象会先从源端读到本地磁盘，再上传到目标端。若两步共用网卡，请为上传流量留出带宽。
 
 ### 单位
 
@@ -340,9 +302,9 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 
 第一次 Ctrl-C 或 `SIGTERM` 取消 worker 池。还没开始的对象保持 `pending`。进行中的分片上传会被中止，只释放这次上传，不删除已提交对象。已经写入 SQLite 的状态会保留。第二次信号立即退出，退出码 130。
 
-如果目标上的 `PutObject` 已经成功，行还没写成 `done`，这一行会停在 `failed`（或 `pending`），但对象已经在目标上。下次 `migrate` 会对目标做 `HeadObject`。大小一致且可比 ETag 也一致时记为 `done`。大小不同，或可比 ETag 不同，记为 `conflict`，并且仍然不会覆盖。
+若源对象的 ETag 在扫描和复制之间发生变化，本次复制会失败。请先用 `scan` 刷新清单，再用 `migrate` 重试，也可直接重新执行 `run`。
 
-取消的请求、截止时间，以及 `request canceled`，都记为 `failed`，即使错误文本里还有 `NotFound` 或 `StatusCode: 404`。分片中止经常带 `NoSuchUpload`。那不是源对象缺失。`skipped` 表示源请求完整结束，并且对象确实已经不在。
+被取消或超时的请求记为 `failed`，即使错误文本里还有 `NotFound` 或 `StatusCode: 404`。分片中止经常带 `NoSuchUpload`。那不是源对象缺失。`skipped` 表示源请求完整结束，并且对象确实已经不在。
 
 ```bash
 ./bin/migration migrate -c config.yaml
@@ -358,7 +320,7 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 | `done` | 已复制并校验，或目标上已有与清单一致的对象 | 不动 |
 | `conflict` | 目标已有该 key，且与清单不一致。未覆盖 | 不动 |
 
-**一致规则。** 大小必须等于清单里的大小。只有两边都有 ETag，且都不是分片 ETag（含 `-`，形如 `hash-N`）时才比较 ETag。分片 ETag 取决于分片边界，所以不比较，只核对大小。大小不同，或可比 ETag 不同，就是冲突。
+目标端已有同名对象时，只有大小相同，且两端 ETag 均非空、完全相同，才会记为 `done`。其余情况均记为 `conflict`，保留目标对象。分片边界不同，即便内容相同也可能产生不同的 ETag。若在上传成功后、状态落盘前中断，恢复时请人工核实这类冲突。
 
 每条冲突在冲突日志里占一行 TSV，时间是 RFC3339 UTC：
 
@@ -366,16 +328,18 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 <object-key>	<source-LastModified>	<target-LastModified>
 ```
 
+键名若包含控制字符或以双引号开头，日志会按 Go 字符串字面量的规则加引号并转义。
+
 只配置了一个桶时，使用写下的 `db_path` 和 `conflict_log`。全桶模式在旁边生成：
 
 - `migration-<桶名>.db`
 - `conflict-<桶名>.log`
 
-一个数据库文件只绑定一个桶。拿去迁另一个桶会失败，错误是 `db_path is bound to bucket "…"`。
+执行 `migrate` 前须先用 `scan` 或 `run` 建立清单。状态库会绑定桶名和两端地址。使用旧版本的状态库前，请先核实它对应的集群。升级后的首次扫描会记录源地址，首次迁移会记录目标地址。扫描失败或中断后，请先重新执行 `scan` 或 `run`，再使用 `migrate`。旧版本的状态库没有扫描完成标记。如果无法确认清单完整，请重新扫描。
 
 ## 用 diff 核对目标
 
-`diff` 实时列出源桶，并对目标上的每个 key 做 `HEAD`。它不读迁移用的 SQLite 清单，也不会上传。
+`diff` 通过大小和可比较的 ETag 核对对象，不下载正文。`ok` 中仅校验了大小的对象另计入 `size_only`。添加 `--extra` 会建立临时索引，列出仅存在于目标端的对象。源桶为空时，`diff` 仍会检查目标桶是否存在。目标桶缺失会返回退出码 1。
 
 ```bash
 ./bin/migration diff -c config.yaml --workers 32
@@ -384,8 +348,8 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 
 ```text
 === diff photos ===
-ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
-一致=1000  缺失=2  大小不一致=0  ETag不一致=1  仅目标有=0
+ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0  size_only=3
+一致=1000  缺失=2  大小不一致=0  ETag不一致=1  仅目标有=0  仅比大小=3
   missing  a.txt  not on target
   etag     b.txt  src=abc dst=def
 ```
@@ -394,7 +358,7 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
 
 | 结果 | 含义 |
 | --- | --- |
-| `missing` | 源有、目标没有。再跑 `migrate` 或 `run` |
+| `missing` | 源端存在，目标端缺失 |
 | `size` / `etag` | 同名但内容对不上。常见原因是目标上已有新写入。本工具不会覆盖 |
 | `extra` | 只在目标上。需要 `--extra` 才会列出。通常是已经写到新集群的数据。不算失败 |
 
@@ -404,13 +368,13 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
 
 | 保证 | 做法 |
 | --- | --- |
-| 不覆盖目标对象 | 每次写入前 `HeadObject`。一致记 `done`。不一致写入 `conflict.log` 并跳过 |
+| 不覆盖目标对象 | `HeadObject` → `PutObject` / `CompleteMultipartUpload` (`If-None-Match: *`) |
 | 不删除 | 没有 `DeleteObject`。分片失败只中止这次上传 |
-| 不走错桶 | `HeadBucket`，每一页核对桶名，SQLite 文件里记下桶名 |
+| 校验桶名 | `HeadBucket`，每一页核对桶名，SQLite 文件里记下桶名 |
 | 迁移中源被删除 | 完整返回的源 404 记 `skipped`。取消和超时记 `failed`，下次会重试 |
-| 崩溃和取消可续 | 每个对象的状态在 SQLite WAL 里。第一次信号取消 worker；下次 `migrate` 继续 |
+| 中断后恢复 | 每个对象的状态在 SQLite WAL 里。第一次信号取消 worker；下次 `migrate` 继续 |
 | 内存有上限 | 小对象落盘。大对象按分片读。任务队列有上限 |
-| 拷后校验 | 总是比大小。单分片对象在两边 ETag 可比时再比 ETag |
+| 复制后校验 | 总是比大小。普通上传的对象在两边 ETag 可比时再比 ETag |
 
 不做：版本历史、删除标记、Object Lock、桶策略、生命周期规则、双向同步，以及服务端 `CopyObject`（两个集群是分开的，字节经过本进程）。
 
@@ -430,19 +394,19 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0
 | `scan` 或 `diff` 没有变慢 | 正常。限额只在 `run` / `migrate` 读对象正文时生效 |
 | 加大 `--workers` 后扫描仍然慢 | 正常。`scan` 是单线程。并发从复制阶段开始，`diff` 的 HEAD 也会用到 |
 | 大量 503 或超时 | 减小 `workers`。大对象再减小 `multipart_concurrency`，让 `workers × multipart_concurrency` 落在代理 `maxconn` 以内 |
-| 大量 `etag mismatch` | 源端 SSE 或压缩会改变 ETag。把 `multipart_threshold` 调低改走分片（只核对大小，不比 ETag），或人工抽查 |
+| 大量 `etag mismatch` | 单独核对相关对象的内容。分片方式和服务端加密都可能影响 ETag。 |
 | `db_path is bound to bucket "…"` | 这个文件已经属于另一个桶。换一个 `db_path` |
 | `database is locked` | 两个进程在写同一个数据库。一个文件只跑一个进程 |
 | 磁盘被临时文件写满 | 把 `spool_dir` 放到大磁盘，或减小 `workers` |
 | Ctrl-C 退不出来 | 等当前请求结束，或再按一次（退出码 130） |
-| `diff` 仍有 `missing` | 再跑 `migrate`，并看 `failed` 行的 `last_error` |
+| `diff` 仍有 `missing` | 若对象状态为 `failed`，先查看 `last_error`，排除原因后重试。若已记为 `done` 或 `conflict`，请另设状态目录，重新建立清单。全桶模式下，仅更换数据库文件名不足以启用新清单。 |
 
 ## 退出码
 
 | 码 | 含义 |
 | --- | --- |
-| 0 | 成功。只迁一个桶时，复制阶段第一次 Ctrl-C（`migrate`，或 `run` 的复制半段）也是 0。没做完的对象留在 SQLite |
-| 1 | 配置错误、远端错误、某个桶失败，或 `diff` 发现缺失或不一致。扫描时第一次 Ctrl-C，以及一次跑多个桶时被中断，也是 1 |
+| 0 | 命令执行完成。冲突以及源端已删除的对象分别计数。 |
+| 1 | 配置有误、操作被中断或失败、有对象复制失败，或 `diff` 发现对象缺失或不一致。 |
 | 130 | 第二次 `SIGINT` 或 `SIGTERM`。进程立即退出 |
 
 命令错误打印在 stderr，形式是 `error: …`。
