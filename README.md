@@ -3,12 +3,12 @@
 <p align="center">
 English | <a href="https://github.com/rustfs/migration/blob/main/README_ZH.md">简体中文</a> |
   <a href="https://github.com/rustfs/migration/blob/main/README_DE.md">Deutsch</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=es">Español</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_ES.md">Español</a> |
   <a href="https://github.com/rustfs/migration/blob/main/README_FR.md">français</a> |
   <a href="https://github.com/rustfs/migration/blob/main/README_JA.md">日本語</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=ko">한국어</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=pt">Portuguese</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=ru">Русский</a>
+  <a href="https://github.com/rustfs/migration/blob/main/README_KO.md">한국어</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_PT.md">Portuguese</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_RU.md">Русский</a>
 </p>
 
 `migration` copies objects one way between two S3-compatible clusters. It targets self-hosted RustFS and MinIO, and any other endpoint that speaks the S3 API. Requests always use path-style addressing, which is the usual setup for those clusters.
@@ -33,12 +33,14 @@ In the config file the source cluster is `old` and the target cluster is `new`.
 | [README_ZH.md](README_ZH.md) | 简体中文，同一结构 |
 | [README_DE.md](README_DE.md) | Deutsch, same structure |
 | [README_FR.md](README_FR.md) | français, same structure |
-| [README_JA.md](README_JA.md) | 日本語，同一结构 |
+| [README_JA.md](README_JA.md) | 日本語, same structure |
+| [README_ES.md](README_ES.md) | Español, same structure |
+| [README_KO.md](README_KO.md) | 한국어, same structure |
+| [README_PT.md](README_PT.md) | Portuguese, same structure |
+| [README_RU.md](README_RU.md) | Русский, same structure |
 | [docs/USAGE.md](docs/USAGE.md) | Short English companion |
 | [docs/使用手册.md](docs/使用手册.md) | Longer Chinese handbook |
 | [docs/DESIGN.md](docs/DESIGN.md) | Architecture and the constraints the tool will not relax |
-
-Español, 한국어, Portuguese, and Русский are linked from the language bar through readme-i18n. They are not checked into this repository.
 
 `migration --help` and `migration <command> --help` print bilingual English and Chinese help.
 

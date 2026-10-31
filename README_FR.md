@@ -4,12 +4,12 @@
   <a href="https://github.com/rustfs/migration/blob/main/README.md">English</a> |
   <a href="https://github.com/rustfs/migration/blob/main/README_ZH.md">简体中文</a> |
   <a href="https://github.com/rustfs/migration/blob/main/README_DE.md">Deutsch</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=es">Español</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_ES.md">Español</a> |
   français |
   <a href="https://github.com/rustfs/migration/blob/main/README_JA.md">日本語</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=ko">한국어</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=pt">Portuguese</a> |
-  <a href="https://readme-i18n.com/rustfs/migration?lang=ru">Русский</a>
+  <a href="https://github.com/rustfs/migration/blob/main/README_KO.md">한국어</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_PT.md">Portuguese</a> |
+  <a href="https://github.com/rustfs/migration/blob/main/README_RU.md">Русский</a>
 </p>
 
 `migration` copie des objets dans un seul sens entre deux clusters compatibles S3. Il vise RustFS et MinIO auto-hébergés, ainsi que tout autre point de terminaison qui parle l'API S3. Les requêtes utilisent toujours l'adressage path-style, habituel sur ces clusters.
@@ -35,11 +35,13 @@ Dans le fichier de configuration, la source est `old` et la cible est `new`.
 | [README_ZH.md](README_ZH.md) | 简体中文 |
 | [README_DE.md](README_DE.md) | Deutsch |
 | [README_JA.md](README_JA.md) | 日本語 |
+| [README_ES.md](README_ES.md) | Español |
+| [README_KO.md](README_KO.md) | 한국어 |
+| [README_PT.md](README_PT.md) | Portuguese |
+| [README_RU.md](README_RU.md) | Русский |
 | [docs/USAGE.md](docs/USAGE.md) | Court compagnon en anglais |
 | [docs/使用手册.md](docs/使用手册.md) | Manuel chinois plus détaillé |
 | [docs/DESIGN.md](docs/DESIGN.md) | Architecture et les contraintes que l'outil ne relâche pas |
-
-Español, 한국어, Portuguese et Русский s'ouvrent depuis la barre de langues via readme-i18n. Ils ne sont pas versionnés dans ce dépôt.
 
 `migration --help` et `migration <commande> --help` affichent l'aide en anglais et en chinois.
 
