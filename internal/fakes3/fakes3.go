@@ -53,7 +53,8 @@ type Server struct {
 	getDelay     time.Duration
 	getInFlight  int
 	getMax       int
-	partDelay    time.Duration
+	partGoal     int
+	partsReady   chan struct{}
 	partInFlight int
 	partMax      int
 	headDelay    time.Duration
@@ -111,11 +112,13 @@ func (s *Server) SetGetDelay(d time.Duration) {
 	s.mu.Unlock()
 }
 
-// SetPartDelay sleeps inside each UploadPart.
-func (s *Server) SetPartDelay(d time.Duration) {
+// RequireConcurrentParts holds the first UploadPart requests until n are in
+// flight together. Subsequent requests proceed normally.
+func (s *Server) RequireConcurrentParts(n int) {
 	s.mu.Lock()
-	s.partDelay = d
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	s.partGoal = n
+	s.partsReady = make(chan struct{})
 }
 
 // SetHeadDelay sleeps inside each HeadObject so tests can observe overlap.
@@ -519,8 +522,33 @@ func (s *Server) createMultipart(w http.ResponseWriter, r *http.Request, bucket,
 }
 
 func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, key string, q url.Values) {
-	release := s.enterFlight(&s.partDelay, &s.partInFlight, &s.partMax)
-	defer release()
+	s.mu.Lock()
+	s.partInFlight++
+	s.partMax = max(s.partMax, s.partInFlight)
+	ready := s.partsReady
+	if ready != nil && s.partInFlight >= s.partGoal {
+		close(ready)
+		s.partsReady = nil
+	}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.partInFlight--
+		s.mu.Unlock()
+	}()
+
+	if ready != nil {
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-ready:
+		case <-r.Context().Done():
+			return
+		case <-timer.C:
+			http.Error(w, "timed out waiting for concurrent UploadPart requests", http.StatusBadRequest)
+			return
+		}
+	}
 
 	body, _ := io.ReadAll(r.Body)
 	partNumber, _ := strconv.Atoi(q.Get("partNumber"))

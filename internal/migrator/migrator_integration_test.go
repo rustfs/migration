@@ -664,7 +664,7 @@ func TestMultipartConcurrencyBoundsParts(t *testing.T) {
 	defer oldS3.Close()
 	newS3 := fakes3.New(t)
 	defer newS3.Close()
-	newS3.SetPartDelay(50 * time.Millisecond)
+	newS3.RequireConcurrentParts(2)
 	oldClient := newTestClient(t, ctx, oldS3.URL)
 	newClient := newTestClient(t, ctx, newS3.URL)
 	if err := cluster.EnsureBucket(ctx, newClient, "bucket"); err != nil {
@@ -693,7 +693,7 @@ func TestMultipartConcurrencyBoundsParts(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := newS3.MaxPartInFlight()
-	if got < 2 || got > 2 {
+	if got != 2 {
 		t.Fatalf("multipart_concurrency=2 max in-flight parts=%d", got)
 	}
 	assertObject(t, newS3, "large.bin", bytes.Repeat([]byte("x"), 32))

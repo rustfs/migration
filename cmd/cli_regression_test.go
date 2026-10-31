@@ -150,7 +150,7 @@ func TestCLIMigrateMultipartAndCleanDiff(t *testing.T) {
 	defer oldS3.Close()
 	newS3 := fakes3.New(t)
 	defer newS3.Close()
-	newS3.SetPartDelay(40 * time.Millisecond)
+	newS3.RequireConcurrentParts(2)
 
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
