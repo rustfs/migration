@@ -3,10 +3,14 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 func TestNewStateFilesArePrivateAndExistingModePreserved(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows file access is governed by ACLs, not Unix mode bits")
+	}
 	path := filepath.Join(t.TempDir(), "state.db")
 	st, err := Open(path, "bucket")
 	if err != nil {

@@ -295,7 +295,7 @@ func decodeKey(key string, encoding types.EncodingType) (string, error) {
 	if encoding != types.EncodingTypeUrl {
 		return key, nil
 	}
-	decoded, err := url.PathUnescape(key)
+	decoded, err := url.QueryUnescape(key)
 	if err != nil {
 		return "", fmt.Errorf("invalid URL-encoded object key %q: %w", key, err)
 	}

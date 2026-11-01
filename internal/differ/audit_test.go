@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/rustfs/migration/internal/fakes3"
 )
 
@@ -200,7 +201,7 @@ func TestDiffDecodesURLKeysWithoutTurningPlusIntoSpace(t *testing.T) {
 				w.Header().Set("Content-Type", "application/xml")
 				fmt.Fprint(w, `<ListBucketResult><Name>bucket</Name><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated>`)
 				for k := range objects {
-					fmt.Fprintf(w, `<Contents><Key>%s</Key><Size>%d</Size><ETag>"%x"</ETag></Contents>`, url.PathEscape(k), len(body), md5.Sum(body))
+					fmt.Fprintf(w, `<Contents><Key>%s</Key><Size>%d</Size><ETag>"%x"</ETag></Contents>`, url.QueryEscape(k), len(body), md5.Sum(body))
 				}
 				fmt.Fprint(w, `</ListBucketResult>`)
 				return
@@ -396,3 +397,12 @@ func TestDiffStreamsAllIssuesAndPropagatesWriterErrors(t *testing.T) {
 type errorWriter struct{}
 
 func (errorWriter) Write([]byte) (int, error) { return 0, errors.New("injected disk failure") }
+
+func TestDecodeKeyHandlesBothSpaceEncodings(t *testing.T) {
+	for _, encoded := range []string{"space+and%2Bplus%25", "space%20and%2Bplus%25"} {
+		got, err := decodeKey(encoded, types.EncodingTypeUrl)
+		if err != nil || got != "space and+plus%" {
+			t.Fatalf("%q decoded to %q: %v", encoded, got, err)
+		}
+	}
+}

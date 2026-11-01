@@ -2,15 +2,17 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 const (
@@ -79,7 +81,11 @@ func open(path, bucket, mode string) (*Store, error) {
 	tuneSQLite(lock)
 	if _, err := lock.Exec(`BEGIN EXCLUSIVE`); err != nil {
 		lock.Close()
-		return nil, fmt.Errorf("state DB %s is in use by another writer: %w", path, err)
+		var sqliteErr *sqlite.Error
+		if errors.As(err, &sqliteErr) && (sqliteErr.Code()&0xff == 5 || sqliteErr.Code()&0xff == 6) {
+			return nil, fmt.Errorf("state DB %s is in use by another writer: %w", path, err)
+		}
+		return nil, fmt.Errorf("acquire state DB lock %s: %w", path, err)
 	}
 	unlock := func() { _, _ = lock.Exec(`ROLLBACK`); _ = lock.Close() }
 	db, err := sql.Open("sqlite", sqliteURI(path, mode, "journal_mode(WAL)", "synchronous(FULL)", "busy_timeout(5000)"))
@@ -119,13 +125,23 @@ func sqliteURI(path, mode string, pragmas ...string) string {
 	if err == nil {
 		path = abs
 	}
-	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
+	u := url.URL{Scheme: "file", Path: sqliteURIPath(filepath.ToSlash(path), runtime.GOOS == "windows")}
 	q := url.Values{"mode": {mode}}
 	for _, pragma := range pragmas {
 		q.Add("_pragma", pragma)
 	}
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+// Drive-letter paths need an absolute URI path. Without the leading slash,
+// net/url formats file://C:/... with C: as the authority, not the path.
+// UNC paths already start with // and must retain both leading slashes.
+func sqliteURIPath(path string, windows bool) string {
+	if windows && len(path) >= 2 && path[1] == ':' && !strings.HasPrefix(path, "/") {
+		return "/" + path
+	}
+	return path
 }
 
 func ensureBucket(db *sql.DB, bucket string) error {

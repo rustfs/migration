@@ -91,7 +91,7 @@ func Run(ctx context.Context, cli *s3.Client, bucket string, st *store.Store) (i
 			key := awsv2.ToString(obj.Key)
 			if page.EncodingType == s3types.EncodingTypeUrl {
 				var err error
-				key, err = url.PathUnescape(key)
+				key, err = url.QueryUnescape(key)
 				if err != nil {
 					return total, fmt.Errorf("decode listed key: %w", err)
 				}

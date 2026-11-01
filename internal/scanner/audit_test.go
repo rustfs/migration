@@ -84,7 +84,7 @@ func TestAuditResumeRejectsDifferentDestination(t *testing.T) {
 // S3 permits object keys that cannot be represented in XML 1.0. Requesting
 // encoding-type=url and decoding the returned key permits a complete inventory.
 func TestAuditScanXMLUnsafeObjectKey(t *testing.T) {
-	const key = "before+\x01%after"
+	const key = "before  +\x01%after"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusOK)
@@ -93,7 +93,7 @@ func TestAuditScanXMLUnsafeObjectKey(t *testing.T) {
 		w.Header().Set("Content-Type", "application/xml")
 		encodedKey, encoding := key, ""
 		if r.URL.Query().Get("encoding-type") == "url" {
-			encodedKey, encoding = "before%2B%01%25after", "<EncodingType>url</EncodingType>"
+			encodedKey, encoding = "before+%20%2B%01%25after", "<EncodingType>url</EncodingType>"
 		}
 		_, _ = fmt.Fprintf(w, `<ListBucketResult><Name>bucket</Name><IsTruncated>false</IsTruncated>%s<Contents><Key>%s</Key><Size>1</Size><ETag>abc</ETag><LastModified>2026-01-01T00:00:00Z</LastModified></Contents></ListBucketResult>`, encoding, encodedKey)
 	}))
