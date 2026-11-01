@@ -21,20 +21,10 @@ import (
 	"github.com/rustfs/migration/internal/config"
 	"github.com/rustfs/migration/internal/differ"
 	"github.com/rustfs/migration/internal/migrator"
-	"github.com/rustfs/migration/internal/safeoutput"
 	"github.com/rustfs/migration/internal/s3client"
+	"github.com/rustfs/migration/internal/safeoutput"
 	"github.com/rustfs/migration/internal/scanner"
 	"github.com/rustfs/migration/internal/store"
-)
-
-var (
-	cfgPath           string
-	bucketFlag        string
-	diffExtra         bool
-	workersFlag       int
-	multipartConcFlag int
-	rateLimitFlag     string
-	sourceFrozenFlag  bool
 )
 
 func Execute() error {
@@ -50,12 +40,12 @@ func NewRoot() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.PersistentFlags().StringVarP(&cfgPath, "config", "c", "config.yaml", "config YAML path / 配置文件路径")
-	root.PersistentFlags().StringVar(&bucketFlag, "bucket", "", "bucket name (empty = all) / 桶名（空=全部）")
-	root.PersistentFlags().IntVar(&workersFlag, "workers", 0, "concurrent objects for run/migrate/diff, overrides YAML (must be >= 1) / 对象并发数，覆盖配置，须 >= 1")
-	root.PersistentFlags().IntVar(&multipartConcFlag, "multipart-concurrency", 0, "parallel parts per large object, overrides YAML (must be >= 1) / 单个大对象的分片并发，覆盖配置，须 >= 1")
-	root.PersistentFlags().StringVar(&rateLimitFlag, "rate-limit", "", "aggregate source-read cap for run/migrate, e.g. 20M or 20MiB; 0 = unlimited / 所有 worker 从源读取的合计上限，例如 20M 或 20MiB；0 表示不限速")
-	root.PersistentFlags().BoolVar(&sourceFrozenFlag, "source-frozen", false, "confirm source writes and deletes are externally frozen for run/migrate / 确认来源的写入和删除已在外部冻结")
+	root.PersistentFlags().StringP("config", "c", "config.yaml", "config YAML path / 配置文件路径")
+	root.PersistentFlags().String("bucket", "", "bucket name (empty = all) / 桶名（空=全部）")
+	root.PersistentFlags().Int("workers", 0, "concurrent objects for run/migrate/diff, overrides YAML (must be >= 1) / 对象并发数，覆盖配置，须 >= 1")
+	root.PersistentFlags().Int("multipart-concurrency", 0, "parallel parts per large object, overrides YAML (must be >= 1) / 单个大对象的分片并发，覆盖配置，须 >= 1")
+	root.PersistentFlags().String("rate-limit", "", "aggregate source-read cap for run/migrate, e.g. 20M or 20MiB; 0 = unlimited / 所有 worker 从源读取的合计上限，例如 20M 或 20MiB；0 表示不限速")
+	root.PersistentFlags().Bool("source-frozen", false, "confirm source writes and deletes are externally frozen for run/migrate / 确认来源的写入和删除已在外部冻结")
 	root.CompletionOptions.DisableDefaultCmd = true
 
 	root.AddCommand(listCmd())
@@ -67,8 +57,8 @@ func NewRoot() *cobra.Command {
 	return root
 }
 
-func signalCtx() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
+func signalCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
 	ch := make(chan os.Signal, 1)
 	stop := make(chan struct{})
 	var once sync.Once
@@ -100,11 +90,19 @@ func signalCtx() (context.Context, context.CancelFunc) {
 }
 
 func loadConfig(cmd *cobra.Command) (*config.Config, error) {
+	flags := cmd.Flags()
+	cfgPath, _ := flags.GetString("config")
+	workersFlag, _ := flags.GetInt("workers")
+	multipartConcFlag, _ := flags.GetInt("multipart-concurrency")
+	rateLimitFlag, _ := flags.GetString("rate-limit")
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return nil, err
 	}
-	cfg.ApplyBucketFlag(bucketFlag)
+	if flags.Changed("bucket") {
+		bucket, _ := flags.GetString("bucket")
+		cfg.ApplyBucketFlag(bucket)
+	}
 	if err := cfg.ValidateNames(); err != nil {
 		return nil, err
 	}
@@ -120,7 +118,7 @@ func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 		return nil, err
 	}
 	if cmd.Flags().Changed("source-frozen") {
-		cfg.SourceFrozen = sourceFrozenFlag
+		cfg.SourceFrozen, _ = flags.GetBool("source-frozen")
 	}
 	return cfg, nil
 }
@@ -138,7 +136,7 @@ func listCmd() *cobra.Command {
 			if err := cfg.ValidateSource(); err != nil {
 				return err
 			}
-			ctx, cancel := signalCtx()
+			ctx, cancel := signalCtx(cmd.Context())
 			defer cancel()
 			oldCli, err := s3client.NewWithPool(ctx, cfg.Old, cfg.MaxInFlight())
 			if err != nil {
@@ -198,7 +196,7 @@ func scanCmd() *cobra.Command {
 			if err := cfg.ValidateSource(); err != nil {
 				return err
 			}
-			ctx, cancel := signalCtx()
+			ctx, cancel := signalCtx(cmd.Context())
 			defer cancel()
 			oldCli, err := s3client.NewWithPool(ctx, cfg.Old, cfg.MaxInFlight())
 			if err != nil {
@@ -240,6 +238,7 @@ func migrateCmd() *cobra.Command {
 func diffCmd() *cobra.Command {
 	var strict bool
 	var jsonlPath string
+	var diffExtra bool
 	c := &cobra.Command{
 		Use:   "diff",
 		Short: diffShort,
@@ -352,7 +351,7 @@ func forEachBucket(cmd *cobra.Command, needTarget bool, fn func(ctx context.Cont
 			return err
 		}
 	}
-	ctx, cancel := signalCtx()
+	ctx, cancel := signalCtx(cmd.Context())
 	defer cancel()
 	pool := cfg.MaxInFlight()
 	oldCli, err := s3client.NewWithPool(ctx, cfg.Old, pool)

@@ -19,12 +19,14 @@ import (
 )
 
 type Metadata struct {
-	ContentType string
-	Metadata    map[string]string
+	ContentEncoding string
+	ContentType     string
+	Metadata        map[string]string
 }
 
 type object struct {
 	body []byte
+	etag string
 	lm   time.Time
 	meta Metadata
 }
@@ -52,7 +54,8 @@ type Server struct {
 	getDelay     time.Duration
 	getInFlight  int
 	getMax       int
-	partDelay    time.Duration
+	partGoal     int
+	partsReady   chan struct{}
 	partInFlight int
 	partMax      int
 	headDelay    time.Duration
@@ -100,6 +103,7 @@ func (s *Server) Put(bucket, key string, body []byte, lm time.Time, meta Metadat
 	}
 	s.buckets[bucket][key] = &object{
 		body: append([]byte(nil), body...),
+		etag: md5hex(body),
 		lm:   lm,
 		meta: meta,
 	}
@@ -112,11 +116,13 @@ func (s *Server) SetGetDelay(d time.Duration) {
 	s.mu.Unlock()
 }
 
-// SetPartDelay sleeps inside each UploadPart.
-func (s *Server) SetPartDelay(d time.Duration) {
+// RequireConcurrentParts holds the first UploadPart requests until n are in
+// flight together. Subsequent requests proceed normally.
+func (s *Server) RequireConcurrentParts(n int) {
 	s.mu.Lock()
-	s.partDelay = d
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	s.partGoal = n
+	s.partsReady = make(chan struct{})
 }
 
 // SetHeadDelay sleeps inside each HeadObject so tests can observe overlap.
@@ -383,7 +389,7 @@ func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket stri
 		}
 		b.WriteString(`<Contents><Key>` + xmlEscape(encodedKey) + `</Key>`)
 		b.WriteString(`<LastModified>` + obj.lm.UTC().Format(time.RFC3339) + `</LastModified>`)
-		b.WriteString(`<ETag>"` + md5hex(obj.body) + `"</ETag>`)
+		b.WriteString(`<ETag>"` + obj.etag + `"</ETag>`)
 		b.WriteString(`<Size>` + strconv.Itoa(len(obj.body)) + `</Size><StorageClass>STANDARD</StorageClass></Contents>`)
 	}
 	b.WriteString(`</ListBucketResult>`)
@@ -406,11 +412,11 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		writeNoSuchKey(w)
 		return
 	}
-	if !matchCondition(w, r, obj.body) {
+	if !matchCondition(w, r, obj.etag) {
 		return
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(obj.body)))
-	w.Header().Set("ETag", `"`+md5hex(obj.body)+`"`)
+	w.Header().Set("ETag", `"`+obj.etag+`"`)
 	w.Header().Set("Last-Modified", obj.lm.UTC().Format(http.TimeFormat))
 	writeMetadataHeaders(w, obj.meta)
 	w.WriteHeader(http.StatusOK)
@@ -454,7 +460,7 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		return
 	}
 	value := obj.body
-	if !matchCondition(w, r, value) {
+	if !matchCondition(w, r, obj.etag) {
 		return
 	}
 	start, end := int64(0), int64(len(value)-1)
@@ -468,7 +474,7 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	}
 	chunk := value[start : end+1]
 	w.Header().Set("Content-Length", strconv.Itoa(len(chunk)))
-	w.Header().Set("ETag", `"`+md5hex(value)+`"`)
+	w.Header().Set("ETag", `"`+obj.etag+`"`)
 	w.Header().Set("Last-Modified", obj.lm.UTC().Format(http.TimeFormat))
 	writeMetadataHeaders(w, obj.meta)
 	if partial {
@@ -508,6 +514,7 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	}
 	s.buckets[bucket][key] = &object{
 		body: body,
+		etag: md5hex(body),
 		lm:   time.Date(2026, 5, 24, 11, 0, 0, 0, time.UTC),
 		meta: readMetadataHeaders(r),
 	}
@@ -531,8 +538,33 @@ func (s *Server) createMultipart(w http.ResponseWriter, r *http.Request, bucket,
 }
 
 func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, key string, q url.Values) {
-	release := s.enterFlight(&s.partDelay, &s.partInFlight, &s.partMax)
-	defer release()
+	s.mu.Lock()
+	s.partInFlight++
+	s.partMax = max(s.partMax, s.partInFlight)
+	ready := s.partsReady
+	if ready != nil && s.partInFlight >= s.partGoal {
+		close(ready)
+		s.partsReady = nil
+	}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.partInFlight--
+		s.mu.Unlock()
+	}()
+
+	if ready != nil {
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-ready:
+		case <-r.Context().Done():
+			return
+		case <-timer.C:
+			http.Error(w, "timed out waiting for concurrent UploadPart requests", http.StatusBadRequest)
+			return
+		}
+	}
 
 	body, _ := io.ReadAll(r.Body)
 	partNumber, _ := strconv.Atoi(q.Get("partNumber"))
@@ -600,8 +632,10 @@ func (s *Server) completeMultipart(w http.ResponseWriter, r *http.Request, bucke
 		writePreconditionFailed(w)
 		return
 	}
+	etag := fmt.Sprintf("%s-%d", md5hex(body), len(nums))
 	s.buckets[bucket][key] = &object{
 		body: body,
+		etag: etag,
 		lm:   time.Date(2026, 5, 24, 11, 0, 0, 0, time.UTC),
 		meta: s.uploadMeta[uploadID],
 	}
@@ -612,7 +646,7 @@ func (s *Server) completeMultipart(w http.ResponseWriter, r *http.Request, bucke
 	delete(s.uploadKey, uploadID)
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/xml")
-	_, _ = fmt.Fprintf(w, `<CompleteMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><ETag>"%s-%d"</ETag></CompleteMultipartUploadResult>`, xmlEscape(bucket), xmlEscape(key), md5hex(body), len(nums))
+	_, _ = fmt.Fprintf(w, `<CompleteMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><ETag>"%s"</ETag></CompleteMultipartUploadResult>`, xmlEscape(bucket), xmlEscape(key), etag)
 }
 
 func parsePath(rawPath string) (bucket, key string) {
@@ -643,6 +677,9 @@ func md5hex(value []byte) string {
 }
 
 func writeMetadataHeaders(w http.ResponseWriter, meta Metadata) {
+	if meta.ContentEncoding != "" {
+		w.Header().Set("Content-Encoding", meta.ContentEncoding)
+	}
 	if meta.ContentType != "" {
 		w.Header().Set("Content-Type", meta.ContentType)
 	}
@@ -653,8 +690,9 @@ func writeMetadataHeaders(w http.ResponseWriter, meta Metadata) {
 
 func readMetadataHeaders(r *http.Request) Metadata {
 	meta := Metadata{
-		ContentType: r.Header.Get("Content-Type"),
-		Metadata:    map[string]string{},
+		ContentType:     r.Header.Get("Content-Type"),
+		ContentEncoding: r.Header.Get("Content-Encoding"),
+		Metadata:        map[string]string{},
 	}
 	if meta.ContentType == "" {
 		meta.ContentType = "application/octet-stream"
@@ -682,8 +720,8 @@ func xmlEscape(s string) string {
 	return replacer.Replace(s)
 }
 
-func matchCondition(w http.ResponseWriter, r *http.Request, body []byte) bool {
-	if etag := r.Header.Get("If-Match"); etag != "" && strings.Trim(etag, `"`) != md5hex(body) {
+func matchCondition(w http.ResponseWriter, r *http.Request, objectETag string) bool {
+	if etag := r.Header.Get("If-Match"); etag != "" && strings.Trim(etag, `"`) != objectETag {
 		writePreconditionFailed(w)
 		return false
 	}

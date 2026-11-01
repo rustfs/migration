@@ -381,3 +381,26 @@ func TestJobBufferCaps(t *testing.T) {
 		t.Fatalf("got %d", JobBuffer(100000))
 	}
 }
+
+func TestRejectsUnsafeBucketNamesAndEndpointCredentials(t *testing.T) {
+	for _, name := range []string{"../other", `..\..\state`, "line\nbreak", ".", "..", "file?mode=ro"} {
+		if err := ValidateBucketName(name); err == nil {
+			t.Fatalf("accepted %q", name)
+		}
+	}
+	c := Config{Old: Endpoint{Endpoint: "https://a:private-secret@example.com", AccessKey: "a", SecretKey: "b"}}
+	if err := c.ValidateSource(); err == nil || strings.Contains(err.Error(), "private-secret") {
+		t.Fatalf("expected safe endpoint error: %v", err)
+	}
+}
+
+func TestMultipartPartSizeMaximum(t *testing.T) {
+	c := Config{MultipartPartSize: MaxMultipartPartSize}
+	if err := c.validateMultipartPartSize(); err != nil {
+		t.Fatal(err)
+	}
+	c.MultipartPartSize++
+	if err := c.validateMultipartPartSize(); err == nil {
+		t.Fatal("part size above 5 GiB accepted")
+	}
+}

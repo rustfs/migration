@@ -21,6 +21,9 @@ func (e apiErr) ErrorMessage() string          { return e.code }
 func (e apiErr) ErrorFault() smithy.ErrorFault { return smithy.FaultClient }
 
 func TestIsNotFound(t *testing.T) {
+	if IsNotFound(errors.New(`Get "https://example.test/bucket/NotFound": EOF`)) {
+		t.Fatal("key text in a network failure cannot establish a 404")
+	}
 	if !IsNotFound(&s3types.NoSuchKey{}) {
 		t.Fatal("NoSuchKey")
 	}
@@ -90,5 +93,11 @@ func TestIsAlreadyExists(t *testing.T) {
 	}
 	if IsAlreadyExists(errors.New("nope")) {
 		t.Fatal("plain")
+	}
+}
+
+func TestIsAlreadyOwned(t *testing.T) {
+	if IsAlreadyOwned(&s3types.BucketAlreadyExists{}) || !IsAlreadyOwned(&s3types.BucketAlreadyOwnedByYou{}) {
+		t.Fatal("incorrect bucket ownership classification")
 	}
 }

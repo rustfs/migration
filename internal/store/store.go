@@ -37,6 +37,10 @@ type Store struct {
 }
 
 func Open(path, bucket string) (*Store, error) {
+	return open(path, bucket, "rwc")
+}
+
+func open(path, bucket, mode string) (*Store, error) {
 	if bucket == "" {
 		return nil, fmt.Errorf("store: bucket must not be empty")
 	}
@@ -78,7 +82,7 @@ func Open(path, bucket string) (*Store, error) {
 		return nil, fmt.Errorf("state DB %s is in use by another writer: %w", path, err)
 	}
 	unlock := func() { _, _ = lock.Exec(`ROLLBACK`); _ = lock.Close() }
-	db, err := sql.Open("sqlite", sqliteURI(path, "rwc", "journal_mode(WAL)", "synchronous(FULL)", "busy_timeout(5000)"))
+	db, err := sql.Open("sqlite", sqliteURI(path, mode, "journal_mode(WAL)", "synchronous(FULL)", "busy_timeout(5000)"))
 	if err != nil {
 		unlock()
 		return nil, err
@@ -427,4 +431,31 @@ func (s *Store) CountWork() (int64, error) {
 	var n int64
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM objects WHERE status IN ('pending','failed')`).Scan(&n)
 	return n, err
+}
+
+// OpenInventory opens an existing, completed inventory under the writer lock.
+func OpenInventory(path, bucket string) (*Store, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("open inventory %s: %w", path, err)
+	}
+	st, err := open(path, bucket, "rw")
+	if err != nil {
+		return nil, err
+	}
+	if err := st.RequireCompleteScan(); err != nil {
+		st.Close()
+		return nil, err
+	}
+	return st, nil
+}
+
+// BindEndpoints is retained for callers using the upstream name.
+func (s *Store) BindEndpoints(source, target string) error { return s.BindMigration(source, target) }
+
+// SetScanComplete is a compatibility wrapper for the generation-based certificate.
+func (s *Store) SetScanComplete(complete bool) error {
+	if complete {
+		return s.CompleteScan()
+	}
+	return s.BeginScan()
 }

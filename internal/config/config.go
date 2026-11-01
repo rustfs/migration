@@ -69,6 +69,7 @@ type Config struct {
 // an already-valid part size, so it is not a reason to silently raise a
 // value the operator chose.
 const MinMultipartPartSize int64 = 5 * 1024 * 1024
+const MaxMultipartPartSize int64 = 5 * 1024 * 1024 * 1024
 
 // Load parses YAML, applies env overrides and defaults. It does not require
 // every field: each command validates what it needs.
@@ -244,18 +245,21 @@ func (c *Config) validateMultipartPartSize() error {
 	if c.MultipartPartSize < MinMultipartPartSize {
 		return fmt.Errorf("multipart_part_size must be >= %d (5 MiB): non-final S3 parts smaller than that are rejected with EntityTooSmall (got %d)", MinMultipartPartSize, c.MultipartPartSize)
 	}
-	if c.MultipartPartSize > 5*1024*1024*1024 {
+	if c.MultipartPartSize > MaxMultipartPartSize {
 		return fmt.Errorf("multipart_part_size must be <= 5 GiB")
 	}
 	return nil
 }
 
 func (c *Config) ValidateNames() error {
+	if c.Bucket == "" {
+		return nil
+	}
 	return ValidateBucketName(c.Bucket)
 }
 
 func ValidateBucketName(name string) error {
-	if name == "." || name == ".." || strings.ContainsAny(name, "/\\") || strings.ContainsFunc(name, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\:<>|"?*`) || strings.ContainsFunc(name, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
 		return fmt.Errorf("bucket %q must not contain whitespace, control characters or path separators", name)
 	}
 	return nil
@@ -299,10 +303,10 @@ func (c *Config) ValidatePair() error {
 
 func validateEndpoint(endpoint string) error {
 	u, err := url.Parse(endpoint)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return fmt.Errorf("endpoint must be an absolute http or https URL")
 	}
-	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return fmt.Errorf("endpoint must not contain credentials, a query or a fragment")
 	}
 	return nil
@@ -417,10 +421,7 @@ func JobBuffer(workers int) int {
 
 // ApplyBucketFlag overrides YAML/env when --bucket is passed.
 func (c *Config) ApplyBucketFlag(flag string) {
-	flag = strings.TrimSpace(flag)
-	if flag != "" {
-		c.Bucket = flag
-	}
+	c.Bucket = strings.TrimSpace(flag)
 }
 
 // DBPathFor returns the state DB for one bucket. Single-bucket mode uses

@@ -3,6 +3,9 @@ package differ
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -154,4 +157,69 @@ func testClient(t *testing.T, ctx context.Context, endpoint string) *s3.Client {
 		t.Fatal(err)
 	}
 	return cli
+}
+
+func TestDiffReturnsTargetErrorWithFullQueue(t *testing.T) {
+	objs := make(map[string][]byte)
+	for i := 0; i < 20; i++ {
+		objs[fmt.Sprintf("key-%02d", i)] = []byte("test")
+	}
+	old := fakes3.NewWithObjects(t, "photos", objs, time.Now())
+	defer old.Close()
+	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer denied.Close()
+	for _, extra := range []bool{false, true} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := Run(ctx, testClient(t, ctx, old.URL), testClient(t, ctx, denied.URL), "photos", Options{Workers: 1, ReportExtra: extra})
+		timedOut := ctx.Err()
+		cancel()
+		if timedOut != nil || err == nil || !strings.Contains(err.Error(), "403") {
+			t.Fatalf("extra=%t: want prompt HEAD error, got %v (ctx=%v)", extra, err, timedOut)
+		}
+	}
+}
+
+func TestDiffRejectsUnverifiableSameSizeObjects(t *testing.T) {
+	old := fakes3.NewWithObjects(t, "photos", map[string][]byte{
+		"ok": []byte("x"), "multipart": []byte("x"), "missing-tag": []byte("x"),
+	}, time.Now())
+	defer old.Close()
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/photos/ok":
+			w.Header().Set("ETag", `"9dd4e461268c8034f5c8564e155c67a6"`)
+		case "/photos/multipart":
+			w.Header().Set("ETag", `"different-2"`)
+		}
+		w.Header().Set("Content-Length", "1")
+		w.WriteHeader(200)
+	}))
+	defer target.Close()
+	ctx := context.Background()
+	res, err := Run(ctx, testClient(t, ctx, old.URL), testClient(t, ctx, target.URL), "photos", Options{Workers: 2})
+	if err == nil && (!res.HasGaps() || res.OK != 0) {
+		t.Fatalf("unreadable target must not be certified: result=%+v", res)
+	}
+}
+
+func TestDiffEmptyBucketMustExistOnTarget(t *testing.T) {
+	ctx := context.Background()
+	src, dst := fakes3.New(t), fakes3.New(t)
+	defer src.Close()
+	defer dst.Close()
+	oldCli, newCli := testClient(t, ctx, src.URL), testClient(t, ctx, dst.URL)
+	if err := cluster.CreateBucket(ctx, oldCli, "photos"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, oldCli, newCli, "photos", Options{}); err == nil {
+		t.Fatal("diff reported success for a missing destination bucket")
+	}
+	if err := cluster.CreateBucket(ctx, newCli, "photos"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, oldCli, newCli, "photos", Options{ReportExtra: true}); err != nil {
+		t.Fatal(err)
+	}
 }

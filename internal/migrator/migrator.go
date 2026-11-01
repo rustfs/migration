@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -24,8 +25,8 @@ import (
 
 	"github.com/rustfs/migration/internal/config"
 	"github.com/rustfs/migration/internal/ratelimit"
-	"github.com/rustfs/migration/internal/safeoutput"
 	"github.com/rustfs/migration/internal/s3client"
+	"github.com/rustfs/migration/internal/safeoutput"
 	"github.com/rustfs/migration/internal/store"
 )
 
@@ -284,7 +285,7 @@ func (m *Migrator) migrateObject(ctx context.Context, obj store.Object) error {
 	if head != nil {
 		return m.reconcileExistingTarget(ctx, obj, snapshot, head)
 	}
-	if obj.Size >= m.Cfg.MultipartThreshold && obj.Size > 0 {
+	if obj.Size > 0 && (obj.Size >= m.Cfg.MultipartThreshold || obj.Size > config.MaxMultipartPartSize) {
 		err = m.copyMultipart(ctx, obj, snapshot)
 	} else {
 		err = m.copySingle(ctx, obj, snapshot)
@@ -683,9 +684,11 @@ func newConflictWriter(path string) (*conflictWriter, error) {
 }
 
 func (c *conflictWriter) Write(key string, oldLM, newLM time.Time) error {
-	// Quote escapes all control characters, including terminal escape codes.
-	quoted := strconv.Quote(key)
-	key = quoted[1 : len(quoted)-1]
+	// Quote keys containing control characters, escapes, or an initial quote so
+	// the first TSV column remains both safe and unambiguously reversible.
+	if strings.HasPrefix(key, `"`) || strings.Contains(key, `\`) || strings.IndexFunc(key, unicode.IsControl) >= 0 {
+		key = strconv.Quote(key)
+	}
 	line := fmt.Sprintf("%s\t%s\t%s\n",
 		key,
 		oldLM.UTC().Format(time.RFC3339),

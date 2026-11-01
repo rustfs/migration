@@ -1,5 +1,7 @@
 # migration
 
+[English guide](docs/USAGE.md) | [简体中文](README_ZH.md) | [Deutsch](README_DE.md) | [Español](README_ES.md) | [Français](README_FR.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | [Português](README_PT.md) | [Русский](README_RU.md)
+
 在两个 S3 兼容集群之间执行可恢复的单向对象迁移。源端必须在迁移和验收期间冻结写入与删除；目标端必须支持 `PutObject` 和 `CompleteMultipartUpload` 的原子 `If-None-Match: *` 条件写。
 
 迁移不调用 DeleteObject 或 CopyObject。已有目标只在两端内容 SHA-256 一致时记为完成，否则报告冲突；不会主动覆盖冲突对象。此保证依赖目标端正确实现 S3 条件写语义，部署前必须验证对应服务版本。**不支持未经协调的在线双端删除**。迁移清单对象在目标端的业务删除也必须暂停或通过删除墓碑协调；仅禁止旧集群删除不能阻止历史对象被重新写入目标。客户端无法在两个独立集群之间建立原子删除事务。

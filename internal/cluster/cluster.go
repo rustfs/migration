@@ -82,13 +82,21 @@ func EnsureBucket(ctx context.Context, cli *s3.Client, name string) error {
 	if !s3client.IsNotFound(err) {
 		return fmt.Errorf("head bucket %q on target: %w", name, err)
 	}
+	return CreateBucket(ctx, cli, name)
+}
+
+// CreateBucket creates a bucket without a preliminary HEAD.
+func CreateBucket(ctx context.Context, cli *s3.Client, name string) error {
+	if err := config.ValidateBucketName(name); err != nil {
+		return err
+	}
 	input := &s3.CreateBucketInput{Bucket: awsv2.String(name)}
 	if region := cli.Options().Region; region != "" && region != "us-east-1" {
 		input.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
 			LocationConstraint: s3types.BucketLocationConstraint(region),
 		}
 	}
-	_, err = cli.CreateBucket(ctx, input)
+	_, err := cli.CreateBucket(ctx, input)
 	if err != nil {
 		var apiErr smithy.APIError
 		if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "BucketAlreadyOwnedByYou" {

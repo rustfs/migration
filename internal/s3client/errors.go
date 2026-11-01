@@ -104,3 +104,6 @@ func IsAlreadyExists(err error) bool {
 	}
 	return false
 }
+
+// IsAlreadyOwned is the explicit ownership-specific name.
+func IsAlreadyOwned(err error) bool { return IsAlreadyExists(err) }

@@ -12,3 +12,4 @@ config.yaml
 /scripts/__pycache__/
 *.db.lock
 *.db.lock-journal
+/dist/
