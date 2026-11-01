@@ -62,7 +62,7 @@ func TestCreateOnlyWritePreservesConcurrentTarget(t *testing.T) {
 			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				q := r.URL.Query()
 				if (r.Method == http.MethodPut && !q.Has("partNumber")) || (r.Method == http.MethodPost && q.Has("uploadId")) {
-					dst.Put("bucket", "key", []byte(tc.winner), time.Now(), fakes3.Metadata{})
+					dst.Put("bucket", "key", []byte(tc.winner), time.Now(), fakes3.Metadata{ContentType: "application/test", Metadata: map[string]string{"origin": "old"}})
 				}
 				if r.Method == http.MethodDelete && q.Has("uploadId") {
 					aborts.Add(1)

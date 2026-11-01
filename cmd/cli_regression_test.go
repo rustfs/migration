@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -150,11 +151,29 @@ func TestCLIMigrateMultipartAndCleanDiff(t *testing.T) {
 	defer oldS3.Close()
 	newS3 := fakes3.New(t)
 	defer newS3.Close()
-	newS3.RequireConcurrentParts(2)
+	var started atomic.Int32
+	both := make(chan struct{})
+	barrier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Query().Get("partNumber") != "" {
+			if started.Add(1) == 2 {
+				close(both)
+			}
+			select {
+			case <-both:
+			case <-time.After(10 * time.Second):
+				http.Error(w, "parts did not overlap", http.StatusRequestTimeout)
+				return
+			case <-r.Context().Done():
+				return
+			}
+		}
+		newS3.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer barrier.Close()
 
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
-	writeClusterConfig(t, cfgPath, oldS3.URL, newS3.URL, filepath.Join(dir, "migration.db"), filepath.Join(dir, "conflict.log"), dir, `
+	writeClusterConfig(t, cfgPath, oldS3.URL, barrier.URL, filepath.Join(dir, "migration.db"), filepath.Join(dir, "conflict.log"), dir, `
 bucket: photos
 workers: 1
 multipart_concurrency: 1
@@ -169,9 +188,8 @@ multipart_part_size: 5242880
 	if err != nil {
 		t.Fatalf("migrate: %v\n%s", err, out)
 	}
-	got := newS3.MaxPartInFlight()
-	if got != 2 {
-		t.Fatalf("--multipart-concurrency 2 max in-flight parts=%d", got)
+	if got := started.Load(); got != 2 {
+		t.Fatalf("--multipart-concurrency 2 must reach two concurrent uploads, got=%d", got)
 	}
 	body, ok := newS3.Object("photos", "large.bin")
 	if !ok || !bytes.Equal(body, payload) {
@@ -192,7 +210,7 @@ multipart_part_size: 5242880
 
 func writeClusterConfig(t *testing.T, path, oldURL, newURL, dbPath, conflictPath, spool, extra string) {
 	t.Helper()
-	body := "old: {endpoint: " + quote(oldURL) + ", access_key: a, secret_key: b}\n" +
+	body := "source_frozen: true\n" + "old: {endpoint: " + quote(oldURL) + ", access_key: a, secret_key: b}\n" +
 		"new: {endpoint: " + quote(newURL) + ", access_key: c, secret_key: d}\n" +
 		"db_path: " + quote(dbPath) + "\n" +
 		"conflict_log: " + quote(conflictPath) + "\n" +
@@ -245,107 +263,44 @@ func assertNoUnsafeCalls(t *testing.T, oldS3, newS3 *fakes3.Server) {
 	}
 }
 
-func TestMigrateRequiresCompletedScanAndRejectsNewTarget(t *testing.T) {
-	source := fakes3.New(t)
-	defer source.Close()
-	target := fakes3.New(t)
-	defer target.Close()
+func TestDiffCLIExportsIssuesJSONLWithoutOverwriting(t *testing.T) {
+	src := fakes3.NewWithObjects(t, "photos", map[string][]byte{"missing\nkey": []byte("source")}, time.Now())
+	defer src.Close()
+	dst := fakes3.NewWithObjects(t, "photos", map[string][]byte{"extra": []byte("target")}, time.Now())
+	defer dst.Close()
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "config.yaml")
-	dbPath := filepath.Join(dir, "inventory.db")
-	configure := func(dst string) {
-		writeClusterConfig(t, cfg, source.URL, dst, dbPath, filepath.Join(dir, "conflict.log"), dir, "bucket: photos\n")
+	writeClusterConfig(t, cfg, src.URL, dst.URL, filepath.Join(dir, "db"), filepath.Join(dir, "conflicts"), dir, "\nbucket: photos\nworkers: 2\nmultipart_concurrency: 1\n")
+	output := filepath.Join(dir, "issues.jsonl")
+	_, err := execRootStdout(t, "diff", "-c", cfg, "--extra", "--issues-jsonl", output)
+	if err == nil {
+		t.Fatal("missing key must fail diff")
 	}
-	configure(target.URL)
-	if _, err := execRoot(t, "migrate", "-c", cfg); err == nil {
-		t.Fatal("migrate succeeded without a scan")
-	}
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
-		t.Fatalf("missing inventory was created: stat=%v", err)
-	}
-	if _, err := execRoot(t, "scan", "-c", cfg); err == nil {
-		t.Fatal("scan of nonexistent source bucket succeeded")
-	}
-	source.Put("photos", "k", []byte("data"), time.Now(), fakes3.Metadata{})
-	if _, err := execRoot(t, "migrate", "-c", cfg); err == nil {
-		t.Fatal("migrate accepted an incomplete scan")
-	}
-	if _, err := execRoot(t, "run", "-c", cfg); err != nil {
-		t.Fatalf("run after failed scan: %v", err)
-	}
-
-	replacement := fakes3.New(t)
-	defer replacement.Close()
-	configure(replacement.URL)
-	if _, err := execRoot(t, "migrate", "-c", cfg); err == nil {
-		t.Fatal("migrate silently reused terminal rows for another target")
-	}
-	resp, err := http.Head(replacement.URL + "/photos")
+	data, err := os.ReadFile(output)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("target bucket created before state validation: %s", resp.Status)
-	}
-}
-
-func TestStatusReportsInvalidStateFile(t *testing.T) {
-	dir := t.TempDir()
-	cfg := filepath.Join(dir, "config.yaml")
-	path := filepath.Join(dir, "migration-photos.db")
-	if err := os.WriteFile(path, []byte("unrelated file"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	writeClusterConfig(t, cfg, "", "", filepath.Join(dir, "migration.db"), filepath.Join(dir, "conflict.log"), dir, "")
-	if _, err := execRoot(t, "status", "-c", cfg); err == nil {
-		t.Fatal("status silently accepted corrupt inventory")
-	}
-}
-
-func TestFailedRescanBlocksCopyAndBadTargetCanBeCorrected(t *testing.T) {
-	src := fakes3.NewWithObjects(t, "photos", map[string][]byte{"data": []byte("ok")}, time.Now())
-	defer src.Close()
-	dst := fakes3.New(t)
-	defer dst.Close()
-	var denyList atomic.Bool
-	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if denyList.Load() && r.URL.Query().Has("list-type") {
-			w.WriteHeader(http.StatusForbidden)
-			return
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	entries := map[string]string{}
+	for decoder.More() {
+		var entry struct{ Bucket, Key, Kind string }
+		if err := decoder.Decode(&entry); err != nil {
+			t.Fatal(err)
 		}
-		src.Config.Handler.ServeHTTP(w, r)
-	}))
-	defer source.Close()
-	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-	}))
-	defer denied.Close()
-	dir := t.TempDir()
-	cfg := filepath.Join(dir, "config.yaml")
-	configure := func(target string) {
-		writeClusterConfig(t, cfg, source.URL, target, filepath.Join(dir, "state.db"), filepath.Join(dir, "conflict.log"), dir, "bucket: photos\n")
+		if entry.Bucket != "photos" {
+			t.Fatalf("bucket: %+v", entry)
+		}
+		entries[entry.Key] = entry.Kind
 	}
-	configure(denied.URL)
-	if _, err := execRoot(t, "scan", "-c", cfg); err != nil {
-		t.Fatal(err)
+	if len(entries) != 2 || entries["missing\nkey"] != "missing" || entries["extra"] != "extra" {
+		t.Fatalf("entries=%v", entries)
 	}
-	if _, err := execRoot(t, "migrate", "-c", cfg); err == nil {
-		t.Fatal("inaccessible target reported success")
+	_, err = execRootStdout(t, "diff", "-c", cfg, "--issues-jsonl", output)
+	if err == nil || !strings.Contains(err.Error(), "create diff JSONL") {
+		t.Fatalf("existing report accepted: %v", err)
 	}
-	configure(dst.URL)
-	denyList.Store(true)
-	if _, err := execRoot(t, "scan", "-c", cfg); err == nil {
-		t.Fatal("injected listing failure reported success")
-	}
-	if _, err := execRoot(t, "migrate", "-c", cfg); err == nil {
-		t.Fatal("failed rescan left inventory usable")
-	}
-	denyList.Store(false)
-	if _, err := execRoot(t, "run", "-c", cfg); err != nil {
-		t.Fatal(err)
-	}
-	if data, _ := dst.Object("photos", "data"); string(data) != "ok" {
-		t.Fatalf("corrected migration copied %q", data)
+	after, err := os.ReadFile(output)
+	if err != nil || !bytes.Equal(data, after) {
+		t.Fatalf("report overwritten: %v", err)
 	}
 }

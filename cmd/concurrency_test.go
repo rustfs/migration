@@ -57,6 +57,15 @@ func withStatusConfig(t *testing.T, args []string) (*config.Config, error) {
 	return got, err
 }
 
+func TestExplicitEmptyBucketSelectsAll(t *testing.T) {
+	t.Setenv("BUCKET", "photos")
+	path := writeTestConfig(t)
+	got, err := withStatusConfig(t, []string{"status", "-c", path, "--bucket", ""})
+	if err != nil || got == nil || !got.AllBuckets() {
+		t.Fatalf("empty bucket flag must override BUCKET: config=%+v err=%v", got, err)
+	}
+}
+
 func TestCLIOverridesConcurrency(t *testing.T) {
 	path := writeTestConfig(t)
 	got, err := withStatusConfig(t, []string{"status", "-c", path, "--workers", "9", "--multipart-concurrency", "5"})

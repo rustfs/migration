@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"net/http"
 	"strings"
 	"syscall"
 
@@ -53,11 +52,23 @@ func IsCanceled(err error) bool {
 // 404s (NoSuchBucket) across the typed and untyped shapes aws-sdk-go-v2
 // returns against self-hosted S3 implementations.
 //
-// NoSuchUpload refers to an upload ID. A URL or key in a transport error
-// can contain any text, including "NoSuchKey", without being a 404.
+// Only structured API codes or an actual HTTP response are evidence of a 404.
+// Object keys and proxy messages in error text must never authorize a write.
 func IsNotFound(err error) bool {
 	if err == nil || IsCanceled(err) {
 		return false
+	}
+	var nsk *s3types.NoSuchKey
+	if errors.As(err, &nsk) {
+		return true
+	}
+	var nf *s3types.NotFound
+	if errors.As(err, &nf) {
+		return true
+	}
+	var nsb *s3types.NoSuchBucket
+	if errors.As(err, &nsb) {
+		return true
 	}
 	var ae smithy.APIError
 	if errors.As(err, &ae) {
@@ -65,23 +76,18 @@ func IsNotFound(err error) bool {
 		case "NoSuchKey", "NotFound", "NoSuchBucket", "404":
 			return true
 		case "":
-			// Some HEAD responses have an HTTP status and no S3 error code.
+			// A HEAD response may have no body or API code.
 		default:
+			// Completed response for some other code, such as NoSuchUpload.
 			return false
 		}
 	}
 	var response interface{ HTTPStatusCode() int }
-	if errors.As(err, &response) {
-		return response.HTTPStatusCode() == http.StatusNotFound
-	}
-	// Also recognize the old, unwrapped SDK response format.
-	msg := err.Error()
-	return strings.HasPrefix(msg, "https response error StatusCode: 404,") &&
-		!strings.Contains(msg, "NoSuchUpload")
+	return errors.As(err, &response) && response.HTTPStatusCode() == 404
 }
 
-// IsAlreadyOwned recognizes a concurrent creation by the same owner.
-func IsAlreadyOwned(err error) bool {
+// IsAlreadyExists matches CreateBucket when the bucket is already there.
+func IsAlreadyExists(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -98,3 +104,6 @@ func IsAlreadyOwned(err error) bool {
 	}
 	return false
 }
+
+// IsAlreadyOwned is the explicit ownership-specific name.
+func IsAlreadyOwned(err error) bool { return IsAlreadyExists(err) }

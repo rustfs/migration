@@ -5,10 +5,10 @@
 # 目标端必须支持普通上传和完成分片上传时的条件写入，才能保留并发写入的同名对象。
 #
 # Env / 环境变量:
-#   OLD_ENDPOINT OLD_AK OLD_SK OLD_REGION
-#   NEW_ENDPOINT NEW_AK NEW_SK NEW_REGION REGION
+#   OLD_ENDPOINT OLD_AK OLD_SK OLD_REGION OLD_SESSION_TOKEN
+#   NEW_ENDPOINT NEW_AK NEW_SK NEW_REGION NEW_SESSION_TOKEN REGION
 #   BUCKET DB_PATH CONFLICT_LOG SPOOL_DIR
-#   WORKERS MULTIPART_CONCURRENCY RATE_LIMIT
+#   WORKERS MULTIPART_CONCURRENCY RATE_LIMIT SOURCE_FROZEN
 
 old:
   endpoint: "http://10.0.0.1:9000"     # source / 来源（只读）
@@ -28,12 +28,14 @@ bucket: ""
 
 db_path: "./migration.db"
 conflict_log: "./conflict.log"
-# Temp dir for small-object spooling. Default = directory of db_path.
-# 小对象落盘目录。默认是 db_path 所在目录。若 /tmp 是内存盘请改到真实磁盘。
+# Temp dir for object and multipart-part spooling. Default = directory of db_path.
+# 对象和分片落盘目录。默认是 db_path 所在目录。若 /tmp 是内存盘请改到真实磁盘。
 # workers 越大，同时存在的临时文件越多，请留出磁盘空间。
+# Maximum aggregate bytes reserved for temporary copy files (default: 1 GiB).
+spool_max_bytes: 1073741824
 spool_dir: ""
 
-# 对象并发：run / migrate 同时复制多少个对象，diff 同时 HEAD 多少个对象。
+# 对象并发：run / migrate 同时复制多少个对象，diff 同时读取并校验多少个对象。
 # scan 始终单线程（List 分页必须串行），不受此项影响。
 # 省略或写 0 = 默认 16。负数会报错。须 >= 1。
 # 命令行覆盖：--workers 32 。环境变量：WORKERS（覆盖本文件，但命令行优先）。
@@ -71,6 +73,11 @@ multipart_concurrency: 4
 #   20Mi / 20MiB = 20 × 1024 × 1024 = 20971520 字节/秒
 # 裸数字表示字节/秒，例如 1048576。大小写不敏感，可以加 /s。
 # K/KB=1000，Ki/KiB=1024；G/GB=1000³，Gi/GiB=1024³。
-# 只限制 run / migrate 复制对象正文。scan / diff / list 不读正文，不受影响。
+# 只限制 run / migrate 复制对象正文。scan / list 不读正文；diff 完整读取两端正文，但不受此速率参数限制。
 # 生产时段示例：rate_limit: 20M 。确认不影响业务后再调到 30M 或 50M。
 rate_limit: 0
+
+# 在应用/存储层冻结源写入及删除后才设 true；本参数不自动冻结 S3。
+# 迁移和最终验收期间必须保持冻结；涉及清单对象的业务删除（包括目标端）也必须暂停或有墓碑协调。
+# 也可使用 --source-frozen。
+source_frozen: false

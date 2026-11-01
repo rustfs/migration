@@ -2,6 +2,8 @@
 
 [English](README.md) | **简体中文** | [Deutsch](README_DE.md) | [Español](README_ES.md) | [Français](README_FR.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | [Português](README_PT.md) | [Русский](README_RU.md)
 
+**重要：本翻译包含过时内容。** 请以[最新使用手册](docs/使用手册.md)和[安全要求](README.md)为准：从扫描到最终验收必须在外部冻结源端写入和删除，并协调目标端删除。`--source-frozen` 不会自动冻结；请验证目标条件写，不能仅凭退出码 0 判定完成。
+
 `migration` 用于将当前对象从一个兼容 S3 的集群复制到另一个集群。例如，业务已切换到新集群写入，但仍需从旧的 RustFS 或 MinIO 集群补齐历史数据。配置中的 `old` 为源集群，`new` 为目标集群，两端均采用路径式寻址。
 
 工具会补齐缺失的对象，将同名冲突记入 `conflict.log`，并用本地 SQLite 数据库保存进度。迁移不会删除对象。目标端的 `PutObject` 和 `CompleteMultipartUpload` 都必须支持 `If-None-Match: *` 条件写入。这样，即使业务在迁移检查之后才写入同名对象，也能保留该对象。

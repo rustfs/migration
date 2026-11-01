@@ -37,7 +37,7 @@ func TestWalkObjectsDecodesKeysOnceAndPreservesOpaqueTokens(t *testing.T) {
 			page = "<EncodingType>url</EncodingType><IsTruncated>true</IsTruncated><NextContinuationToken>" + token + "</NextContinuationToken><Contents><Key>dir%2F%25%32%46%2B+a%20b%09%01</Key><Size>0</Size></Contents>"
 		case token:
 			// Older compatible implementations can omit EncodingType and return plain keys.
-			page = "<Contents><Key>literal%2F</Key><Size>1</Size></Contents>"
+			page = "<IsTruncated>false</IsTruncated><Contents><Key>literal%2F</Key><Size>1</Size></Contents>"
 		default:
 			t.Errorf("unexpected token %q", query.Get("continuation-token"))
 		}
@@ -72,5 +72,26 @@ func TestWalkObjectsRejectsBrokenPagination(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "continuation token") {
 			t.Fatalf("token=%q err=%v", token, err)
 		}
+	}
+}
+
+func TestWalkObjectsRejectsAlternatingTokens(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests > 3 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		next := "a"
+		if r.URL.Query().Get("continuation-token") == "a" {
+			next = "b"
+		}
+		fmt.Fprintf(w, `<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>%s</NextContinuationToken></ListBucketResult>`, next)
+	}))
+	defer server.Close()
+	err := WalkObjects(context.Background(), clientFor(t, server.URL), "photos", func([]types.Object) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "continuation token") || requests != 3 {
+		t.Fatalf("requests=%d err=%v", requests, err)
 	}
 }

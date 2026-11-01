@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README_ZH.md) | **Deutsch** | [Español](README_ES.md) | [Français](README_FR.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | [Português](README_PT.md) | [Русский](README_RU.md)
 
+**Wichtig: Diese Übersetzung ist veraltet.** Für den Betrieb gelten die [aktuelle Anleitung](docs/USAGE.md) und [Sicherheitsvoraussetzungen](README.md): Quelle ab dem Scan bis zur Abnahme extern einfrieren; Löschungen am Ziel koordinieren. `--source-frozen` friert nichts automatisch ein. Zielseitige bedingte Schreibvorgänge müssen geprüft werden. Nicht allein auf Rückgabecode 0 vertrauen.
+
 `migration` kopiert die aktuelle Version jedes Objekts von einem S3-kompatiblen Cluster auf einen anderen. So lassen sich etwa Bestandsdaten aus RustFS oder MinIO übertragen, während Anwendungen bereits in den neuen Cluster schreiben. In der Konfiguration steht `old` für die Quelle und `new` für das Ziel. Beide Endpunkte werden per Pfad angesprochen (Path-Style).
 
 Fehlende Objekte werden kopiert, Konflikte in `conflict.log` protokolliert. Den Fortschritt speichert das Programm lokal in SQLite. Es löscht keine Objekte. Das Ziel muss `If-None-Match: *` bei `PutObject` und `CompleteMultipartUpload` auswerten. So bleiben auch Objekte erhalten, die eine Anwendung erst nach der Prüfung angelegt hat.

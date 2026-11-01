@@ -4,6 +4,7 @@ package fakes3
 
 import (
 	"crypto/md5"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -96,6 +97,9 @@ func (s *Server) Put(bucket, key string, body []byte, lm time.Time, meta Metadat
 	s.ensureBucketLocked(bucket)
 	if meta.Metadata == nil {
 		meta.Metadata = map[string]string{}
+	}
+	if meta.ContentType == "" {
+		meta.ContentType = "application/octet-stream"
 	}
 	s.buckets[bucket][key] = &object{
 		body: append([]byte(nil), body...),
@@ -288,7 +292,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && bucket == "" && key == "":
 		s.listBuckets(w)
 	case r.Method == http.MethodGet && q.Get("list-type") == "2":
-		s.listObjects(w, bucket)
+		s.listObjects(w, r, bucket)
 	case r.Method == http.MethodHead && key == "":
 		s.headBucket(w, bucket)
 	case r.Method == http.MethodPut && key == "" && q.Get("partNumber") == "":
@@ -306,7 +310,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && q.Get("uploadId") != "":
 		s.completeMultipart(w, r, bucket, key, q.Get("uploadId"))
 	case r.Method == http.MethodDelete && q.Get("uploadId") != "":
-		s.abortMultipart(w)
+		s.abortMultipart(w, q.Get("uploadId"))
 	default:
 		http.Error(w, "unsupported", http.StatusBadRequest)
 	}
@@ -356,7 +360,7 @@ func (s *Server) createBucket(w http.ResponseWriter, bucket string) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *Server) listObjects(w http.ResponseWriter, bucket string) {
+func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	bkt, ok := s.buckets[bucket]
@@ -374,9 +378,16 @@ func (s *Server) listObjects(w http.ResponseWriter, bucket string) {
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
 	b.WriteString(`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
 	b.WriteString(`<Name>` + xmlEscape(bucket) + `</Name><Prefix></Prefix><KeyCount>` + strconv.Itoa(len(keys)) + `</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>`)
+	if r.URL.Query().Get("encoding-type") == "url" {
+		b.WriteString(`<EncodingType>url</EncodingType>`)
+	}
 	for _, key := range keys {
 		obj := bkt[key]
-		b.WriteString(`<Contents><Key>` + xmlEscape(key) + `</Key>`)
+		encodedKey := key
+		if r.URL.Query().Get("encoding-type") == "url" {
+			encodedKey = url.PathEscape(key)
+		}
+		b.WriteString(`<Contents><Key>` + xmlEscape(encodedKey) + `</Key>`)
 		b.WriteString(`<LastModified>` + obj.lm.UTC().Format(time.RFC3339) + `</LastModified>`)
 		b.WriteString(`<ETag>"` + obj.etag + `"</ETag>`)
 		b.WriteString(`<Size>` + strconv.Itoa(len(obj.body)) + `</Size><StorageClass>STANDARD</StorageClass></Contents>`)
@@ -401,8 +412,7 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		writeNoSuchKey(w)
 		return
 	}
-	if match := r.Header.Get("If-Match"); match != "" && match != `"`+obj.etag+`"` {
-		w.WriteHeader(http.StatusPreconditionFailed)
+	if !matchCondition(w, r, obj.etag) {
 		return
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(obj.body)))
@@ -412,11 +422,16 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *Server) abortMultipart(w http.ResponseWriter) {
+func (s *Server) abortMultipart(w http.ResponseWriter, uploadID string) {
 	s.mu.Lock()
 	fail := s.failAborts > 0
 	if fail {
 		s.failAborts--
+	} else {
+		delete(s.multipart, uploadID)
+		delete(s.uploadMeta, uploadID)
+		delete(s.uploadBucket, uploadID)
+		delete(s.uploadKey, uploadID)
 	}
 	s.mu.Unlock()
 	if fail {
@@ -444,26 +459,27 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		writeNoSuchKey(w)
 		return
 	}
-	if match := r.Header.Get("If-Match"); match != "" && match != `"`+obj.etag+`"` {
-		w.WriteHeader(http.StatusPreconditionFailed)
+	value := obj.body
+	if !matchCondition(w, r, obj.etag) {
 		return
 	}
-	chunk := obj.body
-	status := http.StatusOK
-	if hdr := r.Header.Get("Range"); hdr != "" {
-		var start, end int
-		if _, err := fmt.Sscanf(hdr, "bytes=%d-%d", &start, &end); err != nil || start < 0 || end >= len(chunk) || start > end {
+	start, end := int64(0), int64(len(value)-1)
+	partial := r.Header.Get("Range") != ""
+	if partial {
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil || start < 0 || end >= int64(len(value)) || start > end {
 			http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(chunk)))
-		chunk = chunk[start : end+1]
-		status = http.StatusPartialContent
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(value)))
 	}
+	chunk := value[start : end+1]
 	w.Header().Set("Content-Length", strconv.Itoa(len(chunk)))
 	w.Header().Set("ETag", `"`+obj.etag+`"`)
+	w.Header().Set("Last-Modified", obj.lm.UTC().Format(http.TimeFormat))
 	writeMetadataHeaders(w, obj.meta)
-	w.WriteHeader(status)
+	if partial {
+		w.WriteHeader(http.StatusPartialContent)
+	}
 	_, _ = w.Write(chunk)
 }
 
@@ -493,7 +509,7 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	s.ensureBucketLocked(bucket)
 	if _, exists := s.buckets[bucket][key]; exists && r.Header.Get("If-None-Match") == "*" {
 		s.mu.Unlock()
-		w.WriteHeader(http.StatusPreconditionFailed)
+		writePreconditionFailed(w)
 		return
 	}
 	s.buckets[bucket][key] = &object{
@@ -572,8 +588,35 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, key string, 
 }
 
 func (s *Server) completeMultipart(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
+	var manifest struct {
+		Parts []struct {
+			PartNumber int    `xml:"PartNumber"`
+			ETag       string `xml:"ETag"`
+		} `xml:"Part"`
+	}
+	if err := xml.NewDecoder(r.Body).Decode(&manifest); err != nil {
+		http.Error(w, "bad manifest", 400)
+		return
+	}
 	s.mu.Lock()
-	parts := s.multipart[uploadID]
+	parts, exists := s.multipart[uploadID]
+	if !exists {
+		s.mu.Unlock()
+		writeNotFound(w, "NoSuchUpload", "missing upload")
+		return
+	}
+	if len(manifest.Parts) != len(parts) {
+		s.mu.Unlock()
+		http.Error(w, "missing parts", 400)
+		return
+	}
+	for i, p := range manifest.Parts {
+		if p.PartNumber != i+1 || strings.Trim(p.ETag, `"`) != md5hex(parts[p.PartNumber]) {
+			s.mu.Unlock()
+			http.Error(w, "invalid part", 400)
+			return
+		}
+	}
 	nums := make([]int, 0, len(parts))
 	for num := range parts {
 		nums = append(nums, num)
@@ -586,7 +629,7 @@ func (s *Server) completeMultipart(w http.ResponseWriter, r *http.Request, bucke
 	s.ensureBucketLocked(bucket)
 	if _, exists := s.buckets[bucket][key]; exists && r.Header.Get("If-None-Match") == "*" {
 		s.mu.Unlock()
-		w.WriteHeader(http.StatusPreconditionFailed)
+		writePreconditionFailed(w)
 		return
 	}
 	etag := fmt.Sprintf("%s-%d", md5hex(body), len(nums))
@@ -607,9 +650,15 @@ func (s *Server) completeMultipart(w http.ResponseWriter, r *http.Request, bucke
 }
 
 func parsePath(rawPath string) (bucket, key string) {
-	// net/http has already decoded URL.Path. Slashes in the key are data.
-	bucket, key, _ = strings.Cut(strings.TrimPrefix(rawPath, "/"), "/")
-	return bucket, key
+	clean := strings.TrimPrefix(rawPath, "/")
+	if clean == "" {
+		return "", ""
+	}
+	bucket, rest, found := strings.Cut(clean, "/")
+	if !found {
+		return bucket, ""
+	}
+	return bucket, rest
 }
 
 func writeNoSuchKey(w http.ResponseWriter) {
@@ -645,6 +694,9 @@ func readMetadataHeaders(r *http.Request) Metadata {
 		ContentEncoding: r.Header.Get("Content-Encoding"),
 		Metadata:        map[string]string{},
 	}
+	if meta.ContentType == "" {
+		meta.ContentType = "application/octet-stream"
+	}
 	for key, values := range r.Header {
 		if !strings.HasPrefix(strings.ToLower(key), "x-amz-meta-") || len(values) == 0 {
 			continue
@@ -666,4 +718,17 @@ func copyMap(src map[string]string) map[string]string {
 func xmlEscape(s string) string {
 	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;", "'", "&apos;")
 	return replacer.Replace(s)
+}
+
+func matchCondition(w http.ResponseWriter, r *http.Request, objectETag string) bool {
+	if etag := r.Header.Get("If-Match"); etag != "" && strings.Trim(etag, `"`) != objectETag {
+		writePreconditionFailed(w)
+		return false
+	}
+	return true
+}
+func writePreconditionFailed(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusPreconditionFailed)
+	_, _ = io.WriteString(w, `<Error><Code>PreconditionFailed</Code></Error>`)
 }

@@ -2,14 +2,17 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 const (
@@ -29,10 +32,17 @@ type Object struct {
 }
 
 type Store struct {
-	db *sql.DB
+	db        *sql.DB
+	lock      *sql.DB
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func Open(path, bucket string) (*Store, error) {
+	return open(path, bucket, "rwc")
+}
+
+func open(path, bucket, mode string) (*Store, error) {
 	if bucket == "" {
 		return nil, fmt.Errorf("store: bucket must not be empty")
 	}
@@ -41,108 +51,125 @@ func Open(path, bucket string) (*Store, error) {
 			return nil, fmt.Errorf("create db dir %s: %w", dir, err)
 		}
 	}
-	db, err := openDB(path, "rwc")
+	// File aliases must share a task lock as well as SQLite's data locks.
+	if canonical, err := filepath.EvalSymlinks(path); err == nil {
+		path = canonical
+	} else if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		path = filepath.Join(dir, filepath.Base(path))
+	}
+	// SQLite otherwise creates files according to the process umask, which can
+	// expose object names and errors to other local users. Preserve permissions
+	// on existing databases, which may intentionally be shared.
+	for _, name := range []string{path + ".lock", path} {
+		f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil && !os.IsExist(err) {
+			return nil, fmt.Errorf("create state file %s: %w", name, err)
+		}
+		if err == nil {
+			if err := f.Close(); err != nil {
+				return nil, fmt.Errorf("close state file %s: %w", name, err)
+			}
+		}
+	}
+	// A separate SQLite pager lock is held for the whole writer lifetime. It
+	// protects the migration task, not just individual status transactions,
+	// and the OS releases it automatically if the process crashes.
+	lock, err := sql.Open("sqlite", sqliteURI(path+".lock", "rwc", "busy_timeout(0)"))
 	if err != nil {
 		return nil, err
+	}
+	tuneSQLite(lock)
+	if _, err := lock.Exec(`BEGIN EXCLUSIVE`); err != nil {
+		lock.Close()
+		var sqliteErr *sqlite.Error
+		if errors.As(err, &sqliteErr) && (sqliteErr.Code()&0xff == 5 || sqliteErr.Code()&0xff == 6) {
+			return nil, fmt.Errorf("state DB %s is in use by another writer: %w", path, err)
+		}
+		return nil, fmt.Errorf("acquire state DB lock %s: %w", path, err)
+	}
+	unlock := func() { _, _ = lock.Exec(`ROLLBACK`); _ = lock.Close() }
+	db, err := sql.Open("sqlite", sqliteURI(path, mode, "journal_mode(WAL)", "synchronous(FULL)", "busy_timeout(5000)"))
+	if err != nil {
+		unlock()
+		return nil, err
+	}
+	tuneSQLite(db)
+	var existingSchema int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='objects'`).Scan(&existingSchema); err != nil {
+		db.Close()
+		unlock()
+		return nil, fmt.Errorf("inspect schema: %w", err)
 	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
+		unlock()
 		return nil, fmt.Errorf("init schema: %w", err)
+	}
+	if existingSchema == 0 {
+		if _, err := db.Exec(`INSERT INTO meta(key,value) VALUES('state_format','2')`); err != nil {
+			db.Close()
+			unlock()
+			return nil, fmt.Errorf("initialize state format: %w", err)
+		}
 	}
 	if err := ensureBucket(db, bucket); err != nil {
 		db.Close()
+		unlock()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, lock: lock}, nil
+}
+
+func sqliteURI(path, mode string, pragmas ...string) string {
+	abs, err := filepath.Abs(path)
+	if err == nil {
+		path = abs
+	}
+	u := url.URL{Scheme: "file", Path: sqliteURIPath(filepath.ToSlash(path), runtime.GOOS == "windows")}
+	q := url.Values{"mode": {mode}}
+	for _, pragma := range pragmas {
+		q.Add("_pragma", pragma)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// Drive-letter paths need an absolute URI path. Without the leading slash,
+// net/url formats file://C:/... with C: as the authority, not the path.
+// UNC paths already start with // and must retain both leading slashes.
+func sqliteURIPath(path string, windows bool) string {
+	if windows && len(path) >= 2 && path[1] == ':' && !strings.HasPrefix(path, "/") {
+		return "/" + path
+	}
+	return path
 }
 
 func ensureBucket(db *sql.DB, bucket string) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	res, err := tx.Exec(`INSERT INTO meta(key,value) VALUES('bucket',?) ON CONFLICT(key) DO NOTHING`, bucket)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 1 {
-		if _, err := tx.Exec(`INSERT INTO meta(key,value) VALUES('scan_complete', '0')`); err != nil {
-			return err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return checkBucket(db, bucket)
-}
-
-func checkBucket(db *sql.DB, bucket string) error {
 	var existing string
-	if err := db.QueryRow(`SELECT value FROM meta WHERE key='bucket'`).Scan(&existing); err != nil {
+	err := db.QueryRow(`SELECT value FROM meta WHERE key = 'bucket'`).Scan(&existing)
+	switch {
+	case err == sql.ErrNoRows:
+		_, err := db.Exec(`INSERT INTO meta(key, value) VALUES('bucket', ?)`, bucket)
+		return err
+	case err != nil:
 		return fmt.Errorf("read bucket meta: %w", err)
-	}
-	if existing != bucket {
+	case existing != bucket:
 		return fmt.Errorf("db_path is bound to bucket %q but config requests %q; use a separate db_path per bucket", existing, bucket)
 	}
 	return nil
 }
 
-// BindEndpoints prevents terminal rows from one migration being reused for
-// another. A scan only knows the source. Existing pre-binding databases adopt
-// their configured endpoint on first use without discarding completed work.
-func (s *Store) BindEndpoints(source, target string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, entry := range []struct{ key, value string }{{"source_endpoint", source}, {"target_endpoint", target}} {
-		if entry.value == "" {
-			continue
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() {
+		s.closeErr = s.db.Close()
+		if s.lock != nil {
+			_, _ = s.lock.Exec(`ROLLBACK`)
+			if err := s.lock.Close(); s.closeErr == nil {
+				s.closeErr = err
+			}
 		}
-		if _, err := tx.Exec(`INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING`, entry.key, entry.value); err != nil {
-			return err
-		}
-		var bound string
-		if err := tx.QueryRow(`SELECT value FROM meta WHERE key=?`, entry.key).Scan(&bound); err != nil {
-			return err
-		}
-		if bound != entry.value {
-			return fmt.Errorf("db_path is bound to %s %q, configured %q; use a separate db_path for this migration", entry.key, bound, entry.value)
-		}
-	}
-	return tx.Commit()
-}
-
-func (s *Store) Close() error { return s.db.Close() }
-
-func openDB(path, mode string) (*sql.DB, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return nil, err
-	}
-	// SQLite file URIs require a leading slash before Windows drive letters.
-	name := filepath.ToSlash(abs)
-	if !strings.HasPrefix(name, "/") {
-		name = "/" + name
-	}
-	query := url.Values{"mode": {mode}, "_pragma": {"busy_timeout(5000)"}}
-	if mode != "ro" {
-		query.Add("_pragma", "journal_mode(WAL)")
-		query.Add("_pragma", "synchronous(NORMAL)")
-	}
-	uri := url.URL{Scheme: "file", Path: name, RawQuery: query.Encode()}
-	db, err := sql.Open("sqlite", uri.String())
-	if err != nil {
-		return nil, err
-	}
-	tuneSQLite(db)
-	return db, nil
+	})
+	return s.closeErr
 }
 
 // tuneSQLite keeps a single connection. WAL still allows a writer plus
@@ -155,12 +182,13 @@ func tuneSQLite(db *sql.DB) {
 	db.SetMaxIdleConns(1)
 }
 
-// OpenExisting opens a state database read-only for status.
+// OpenExisting opens a state DB read-only without taking the writer lock.
 func OpenExisting(path string) (*Store, error) {
-	db, err := openDB(path, "ro")
+	db, err := sql.Open("sqlite", sqliteURI(path, "ro", "busy_timeout(5000)"))
 	if err != nil {
 		return nil, err
 	}
+	tuneSQLite(db)
 	s := &Store{db: db}
 	if _, err := s.BoundBucket(); err != nil {
 		db.Close()
@@ -169,32 +197,108 @@ func OpenExisting(path string) (*Store, error) {
 	return s, nil
 }
 
-// OpenInventory requires a state DB created by scan, and never creates one.
-func OpenInventory(path, bucket string) (*Store, error) {
-	db, err := openDB(path, "rw")
+// BindMigration prevents a checkpoint being reused against another source or
+// target. A source-only scan may omit target and bind it on the first copy.
+// Credentials are deliberately not persisted in the state database.
+func (s *Store) BindMigration(source, target string) error {
+	source, target = normalizeEndpoint(source), normalizeEndpoint(target)
+	if source == "" {
+		return fmt.Errorf("migration source identity is required")
+	}
+	tx, err := s.db.Begin()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err := checkBucket(db, bucket); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("open inventory %s (run scan first): %w", path, err)
+	defer tx.Rollback()
+	var boundSource, boundTarget, format string
+	read := func(key string, dst *string) error {
+		err := tx.QueryRow(`SELECT value FROM meta WHERE key=?`, key).Scan(dst)
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		return err
 	}
-	var incomplete bool
-	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM meta WHERE key='scan_complete' AND value != '1')`).Scan(&incomplete); err != nil {
-		db.Close()
-		return nil, err
+	if err := read("source_endpoint", &boundSource); err != nil {
+		return err
 	}
-	if incomplete {
-		db.Close()
-		return nil, fmt.Errorf("inventory %s is incomplete; run scan again", path)
+	if err := read("target_endpoint", &boundTarget); err != nil {
+		return err
 	}
-	return &Store{db: db}, nil
+	if boundSource != "" && boundSource != source {
+		return fmt.Errorf("state DB source mismatch: bound to %q, requested %q; use a new state directory", boundSource, source)
+	}
+	if target != "" && boundTarget != "" && boundTarget != target {
+		return fmt.Errorf("state DB target mismatch: bound to %q, requested %q; use a new state directory", boundTarget, target)
+	}
+	if boundSource == "" || (target != "" && boundTarget == "") {
+		if err := read("state_format", &format); err != nil {
+			return err
+		}
+		var unsafeRows int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM objects WHERE ? != '2' OR attempts > 0 OR status != 'pending'`, format).Scan(&unsafeRows); err != nil {
+			return err
+		}
+		if unsafeRows > 0 {
+			return fmt.Errorf("unbound legacy or previously migrated state cannot be adopted safely; use a new state directory and rescan")
+		}
+		if format != "2" {
+			if _, err := tx.Exec(`INSERT INTO meta(key,value) VALUES('state_format','2') ON CONFLICT(key) DO UPDATE SET value=excluded.value`); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO meta(key,value) VALUES('source_endpoint',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, source); err != nil {
+		return err
+	}
+	if target != "" {
+		if _, err := tx.Exec(`INSERT INTO meta(key,value) VALUES('target_endpoint',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, target); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
-// SetScanComplete leaves the last scan marked incomplete until all pages are durable.
-func (s *Store) SetScanComplete(complete bool) error {
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO meta(key,value) VALUES('scan_complete',?)`, complete)
+func normalizeEndpoint(endpoint string) string {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
+		u.Scheme = strings.ToLower(u.Scheme)
+		u.Host = strings.ToLower(u.Host)
+		u.User = nil
+		endpoint = u.String()
+	}
+	return endpoint
+}
+
+// BeginScan invalidates the previous completeness certificate before any
+// network request. An interrupted scan must never authorize migration.
+func (s *Store) BeginScan() error {
+	_, err := s.db.Exec(`INSERT INTO meta(key,value) VALUES('scan_generation','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1`)
 	return err
+}
+
+func (s *Store) CompleteScan() error {
+	result, err := s.db.Exec(`INSERT INTO meta(key,value) SELECT 'scan_complete_generation',value FROM meta WHERE key='scan_generation' AND CAST(value AS INTEGER)>0 ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return fmt.Errorf("cannot complete a scan that was never started")
+	}
+	return nil
+}
+
+func (s *Store) RequireCompleteScan() error {
+	var complete int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM meta current JOIN meta completed ON completed.key='scan_complete_generation' AND completed.value=current.value WHERE current.key='scan_generation' AND CAST(current.value AS INTEGER)>0`).Scan(&complete)
+	if err != nil {
+		return err
+	}
+	if complete != 1 {
+		return fmt.Errorf("state DB has no complete inventory; run scan or run successfully before migrate")
+	}
+	return nil
 }
 
 func (s *Store) BoundBucket() (string, error) {
@@ -222,9 +326,8 @@ CREATE TABLE IF NOT EXISTS meta (
 `
 
 // BatchUpsertScanned records objects discovered during scan.
-// Terminal rows (done/conflict) are left untouched.
-// pending/failed/skipped rows are refreshed and reset to pending, so a
-// skipped object that reappears on the source is retried.
+// Changed source identities invalidate previous completion and conflicts.
+// Rechecking a changed key never authorizes overwriting a target object.
 func (s *Store) BatchUpsertScanned(objs []Object) error {
 	if len(objs) == 0 {
 		return nil
@@ -244,6 +347,9 @@ func (s *Store) BatchUpsertScanned(objs []Object) error {
             status = 'pending',
             last_error = ''
         WHERE objects.status IN ('pending','failed','skipped')
+           OR objects.size != excluded.size
+           OR objects.last_modified != excluded.last_modified
+           OR COALESCE(objects.etag,'') != COALESCE(excluded.etag,'')
     `)
 	if err != nil {
 		tx.Rollback()
@@ -341,4 +447,31 @@ func (s *Store) CountWork() (int64, error) {
 	var n int64
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM objects WHERE status IN ('pending','failed')`).Scan(&n)
 	return n, err
+}
+
+// OpenInventory opens an existing, completed inventory under the writer lock.
+func OpenInventory(path, bucket string) (*Store, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("open inventory %s: %w", path, err)
+	}
+	st, err := open(path, bucket, "rw")
+	if err != nil {
+		return nil, err
+	}
+	if err := st.RequireCompleteScan(); err != nil {
+		st.Close()
+		return nil, err
+	}
+	return st, nil
+}
+
+// BindEndpoints is retained for callers using the upstream name.
+func (s *Store) BindEndpoints(source, target string) error { return s.BindMigration(source, target) }
+
+// SetScanComplete is a compatibility wrapper for the generation-based certificate.
+func (s *Store) SetScanComplete(complete bool) error {
+	if complete {
+		return s.CompleteScan()
+	}
+	return s.BeginScan()
 }

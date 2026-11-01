@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README_ZH.md) | [Deutsch](README_DE.md) | [Español](README_ES.md) | **Français** | [日本語](README_JA.md) | [한국어](README_KO.md) | [Português](README_PT.md) | [Русский](README_RU.md)
 
+**Important : cette traduction est obsolète.** Suivez le [guide actuel](docs/USAGE.md) et les [conditions de sécurité](README.md) : geler la source à partir du scan jusqu’à la validation et coordonner les suppressions sur la destination. `--source-frozen` ne gèle rien automatiquement. Vérifiez les écritures conditionnelles et ne concluez pas au succès sur le seul code de sortie 0.
+
 `migration` copie la version courante des objets d’un cluster compatible S3 vers un autre. Vous pouvez ainsi transférer les données historiques d’un cluster RustFS ou MinIO pendant que les applications écrivent déjà sur le nouveau cluster. Dans la configuration, `old` désigne la source et `new` la destination. Les deux utilisent des URL S3 où le nom du bucket figure dans le chemin.
 
 L’outil copie les clés manquantes, consigne les conflits dans `conflict.log` et enregistre sa progression dans une base SQLite locale. Il ne supprime aucun objet. La destination doit prendre en charge `If-None-Match: *` pour `PutObject` et `CompleteMultipartUpload`. Un objet créé par une application après la vérification initiale reste ainsi intact.

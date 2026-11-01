@@ -7,4 +7,9 @@
 conflict.log
 conflict-*.log
 config.yaml
+
+/audit-results/
+/scripts/__pycache__/
+*.db.lock
+*.db.lock-journal
 /dist/

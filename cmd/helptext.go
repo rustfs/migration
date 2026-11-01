@@ -5,25 +5,24 @@ const Version = "0.2.0"
 const rootShort = `Safe one-way S3 migration / 安全的单向 S3 迁移`
 
 const rootLong = `migration copies objects from a source S3-compatible cluster to a target.
-Never overwrites on targets that support If-None-Match for PUT and multipart completion.
-Never deletes objects. Resume after Ctrl-C via local SQLite.
+Never overwrites. Never deletes. Resume after Ctrl-C via local SQLite.
 
 migration 把对象从来源 S3 兼容集群复制到目标集群。
-目标须支持普通上传和完成分片上传时的条件写入，以保证永不覆盖。
-迁移不会删除对象。进度保存在本地 SQLite 中，按 Ctrl-C 停止后可继续。
+永不覆盖、永不删除；用本地 SQLite 记录进度，Ctrl-C 后续跑即可。
 
 Quick start / 快速开始:
   1. cp config.example.yaml config.yaml
   2. Fill in old/new endpoints and keys  （填写来源/目标地址和密钥）
-  3. migration run  -c config.yaml       # scan + copy / 扫描并复制
+  3. Freeze source writes/deletes, then confirm --source-frozen / 冻结源写入和删除后确认
+     migration run -c config.yaml --source-frozen
   4. migration diff -c config.yaml       # verify no gaps / 核对有无遗漏
 
 Leave bucket empty in YAML to migrate every bucket on the source.
 YAML 里 bucket 留空，就会迁移来源上的每一个桶。
 
 Concurrency / 并发:
-  workers                 objects copied or HEADed at once (default 16)
-                          同时复制（diff 时则是同时 HEAD）的对象数，默认 16
+  workers                 objects copied or verified at once (default 16)
+                          同时复制（diff 时读取两端正文校验）的对象数，默认 16
   multipart_concurrency   parts of one large object in parallel (default 4)
                           单个大对象同时上传的分片数，默认 4
   Scan is single-threaded. Peak HTTP is about workers × multipart_concurrency.
@@ -58,6 +57,9 @@ does not yet exist on the target. Resumable. Never overwrites.
 一步完成迁移：先扫描来源清单，再把目标上还不存在的对象复制过去。
 可断点续传，永不覆盖。
 
+Freeze source writes and deletes before run/migrate; explicitly set --source-frozen.
+执行 run/migrate 前须在外部冻结来源写入和删除，并明确设置 --source-frozen。
+
 --workers controls how many objects are copied at once.
 --multipart-concurrency controls parts inside one large object.
 --rate-limit caps the total bytes/sec those workers read from the source.
@@ -70,10 +72,10 @@ Scan itself stays single-threaded and is not rate limited.
 20M = 20×1000×1000 B/s；20MiB = 20×1024×1024 B/s；0 = 不限速。
 
 Examples:
-  migration run -c config.yaml
-  migration run -c config.yaml --bucket photos --workers 32
-  migration run -c config.yaml --multipart-concurrency 8
-  migration run -c config.yaml --workers 16 --rate-limit 20M`
+  migration run -c config.yaml --source-frozen
+  migration run -c config.yaml --source-frozen --bucket photos --workers 32
+  migration run -c config.yaml --source-frozen --multipart-concurrency 8
+  migration run -c config.yaml --source-frozen --workers 16 --rate-limit 20M`
 
 const scanShort = `Inventory source objects into SQLite / 扫描源对象到本地 SQLite`
 const scanLong = `Walk ListObjectsV2 on the source and upsert {key,size,mtime,etag} locally.
@@ -81,7 +83,7 @@ Re-running scan picks up new keys and retries skipped/failed rows.
 Does not write to the target.
 
 对来源做 ListObjectsV2，把 {key,size,mtime,etag} 写入本地 SQLite。
-再次扫描会收录新对象，并将之前跳过或失败的对象重新标记为 pending。
+再次扫描会收录新对象，并让 previously skipped/failed 的行重新进入 pending。
 不会对目标写入。
 
 Scan is single-threaded. --workers does not speed up listing.
@@ -91,12 +93,14 @@ Example:
   migration scan -c config.yaml`
 
 const migrateShort = `Copy pending objects (never overwrites) / 复制待迁移对象（永不覆盖）`
-const migrateLong = `Copy pending/failed rows from a completed scan. Existing keys are marked done
-only if the size and a nonempty ETag both match. All other existing keys are
-logged as conflicts. A failed copy or an interrupted run exits nonzero.
+const migrateLong = `Copy every SQLite row in pending/failed. If the key already exists on
+the target and its full SHA-256 and preserved metadata match the source, it is marked done.
+An existing complete scan and --source-frozen are required. A different object is logged to
+conflict.log and left untouched.
 
-复制已扫描清单中待处理或失败的对象。目标上已有同名对象时，只有大小和非空 ETag
-均相同才记为 done，否则记入冲突日志。复制失败或运行中断时，命令以非零状态退出。
+复制已有完整扫描清单中 pending/failed 的对象，执行前确认 --source-frozen。
+目标已有同名 key 且两端正文 SHA-256 和保留的元数据一致则记为 done。不一致则写入
+conflict.log，不覆盖。
 
 --workers is the object pool. --multipart-concurrency is per large object.
 --rate-limit is the shared source-read cap across that pool (0 = unlimited).
@@ -105,7 +109,7 @@ logged as conflicts. A failed copy or an interrupted run exits nonzero.
 20M = 20×1000×1000 B/s；20MiB = 20×1024×1024 B/s。
 
 Example:
-  migration migrate -c config.yaml --workers 8 --rate-limit 30M`
+  migration migrate -c config.yaml --source-frozen --workers 8 --rate-limit 30M`
 
 const statusShort = `Show local progress counters / 显示本地进度`
 const statusLong = `Print per-bucket counters from the local state DB(s). No S3 calls.
@@ -115,15 +119,17 @@ Example:
   migration status -c config.yaml`
 
 const diffShort = `Compare source vs target / 对比源与目标`
-const diffLong = `List the source and HEAD each key on the target. Reports missing objects
-and size/ETag mismatches. size_only counts keys compared by size alone.
-Exit code 1 for missing keys, mismatches or errors.
+const diffLong = `List the source, HEAD the target, and read both object bodies to compare SHA-256.
+Reports missing objects and size/content/preserved-metadata mismatches; gaps or read errors exit 1.
+Keep both clusters quiescent during final verification. This reads all data,
+requires GetObject on both endpoints, and is not subject to --rate-limit.
 
-列出源对象并对目标做 HEAD：报告缺失、大小/ETag 不一致。
-size_only 表示仅通过大小检查的对象数。缺失、不匹配或出错时退出码为 1。
+列出源对象、对目标做 HEAD，并读取两端完整正文进行 SHA-256 校验。
+缺失、大小/内容/保留元数据不一致或读取错误时退出码为 1。最终验收期间两端须保持静止。
+需要两端 GetObject 权限，会读取全部数据，当前不受 --rate-limit 限制。
 
---workers controls parallel HEAD requests. It does not upload anything.
---workers 控制并行 HEAD 的数量，diff 不会上传对象。
+--workers controls parallel object verification. It does not upload anything.
+--workers 控制同时校验的对象数，diff 不会上传对象。
 
 Examples:
   migration diff -c config.yaml
@@ -153,4 +159,5 @@ Env overrides / 环境变量覆盖:
   OLD_ENDPOINT OLD_AK OLD_SK OLD_REGION
   NEW_ENDPOINT NEW_AK NEW_SK NEW_REGION
   BUCKET DB_PATH CONFLICT_LOG SPOOL_DIR REGION
-  WORKERS MULTIPART_CONCURRENCY RATE_LIMIT`
+  WORKERS MULTIPART_CONCURRENCY RATE_LIMIT SOURCE_FROZEN
+  OLD_SESSION_TOKEN NEW_SESSION_TOKEN`

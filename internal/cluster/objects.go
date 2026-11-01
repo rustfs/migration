@@ -14,6 +14,7 @@ import (
 // encoding so even keys containing characters forbidden in XML can be listed.
 func WalkObjects(ctx context.Context, cli *s3.Client, bucket string, visit func([]types.Object) error) error {
 	input := &s3.ListObjectsV2Input{Bucket: aws.String(bucket), EncodingType: types.EncodingTypeUrl}
+	seenTokens := make(map[string]struct{})
 	for {
 		page, err := cli.ListObjectsV2(ctx, input)
 		if err != nil {
@@ -21,6 +22,9 @@ func WalkObjects(ctx context.Context, cli *s3.Client, bucket string, visit func(
 		}
 		if name := aws.ToString(page.Name); name != "" && name != bucket {
 			return fmt.Errorf("list page bucket mismatch: requested %q, server returned %q", bucket, name)
+		}
+		if page.IsTruncated == nil {
+			return fmt.Errorf("incomplete listing for bucket %q: missing IsTruncated", bucket)
 		}
 		for i := range page.Contents {
 			obj := &page.Contents[i]
@@ -44,9 +48,10 @@ func WalkObjects(ctx context.Context, cli *s3.Client, bucket string, visit func(
 			return nil
 		}
 		next := aws.ToString(page.NextContinuationToken)
-		if next == "" || next == aws.ToString(input.ContinuationToken) {
+		if _, exists := seenTokens[next]; next == "" || exists {
 			return fmt.Errorf("truncated listing for bucket %q has a missing or repeated continuation token", bucket)
 		}
+		seenTokens[next] = struct{}{}
 		input.ContinuationToken = page.NextContinuationToken
 	}
 }

@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -19,13 +21,16 @@ const (
 	// DefaultMultipartConcurrency is the per-object part parallelism when
 	// multipart_concurrency is omitted or 0.
 	DefaultMultipartConcurrency = 4
+	// DefaultSpoolMaxBytes bounds temporary copy data for one migration.
+	DefaultSpoolMaxBytes int64 = 1 << 30
 )
 
 type Endpoint struct {
-	Endpoint  string `yaml:"endpoint"`
-	AccessKey string `yaml:"access_key"`
-	SecretKey string `yaml:"secret_key"`
-	Region    string `yaml:"region"`
+	Endpoint     string `yaml:"endpoint"`
+	AccessKey    string `yaml:"access_key"`
+	SecretKey    string `yaml:"secret_key"`
+	Region       string `yaml:"region"`
+	SessionToken string `yaml:"session_token"`
 }
 
 type Config struct {
@@ -33,10 +38,14 @@ type Config struct {
 	New Endpoint `yaml:"new"`
 
 	// Bucket is optional. Empty means "every bucket on the source".
-	Bucket      string `yaml:"bucket"`
-	DBPath      string `yaml:"db_path"`
-	ConflictLog string `yaml:"conflict_log"`
-	SpoolDir    string `yaml:"spool_dir"`
+	Bucket        string `yaml:"bucket"`
+	DBPath        string `yaml:"db_path"`
+	ConflictLog   string `yaml:"conflict_log"`
+	SpoolDir      string `yaml:"spool_dir"`
+	SpoolMaxBytes int64  `yaml:"spool_max_bytes"`
+	// SourceFrozen is an operator assertion, not a remote locking mechanism.
+	// Source writes and deletes must remain frozen through final verification.
+	SourceFrozen bool `yaml:"source_frozen"`
 
 	Workers              int   `yaml:"workers"`
 	MultipartThreshold   int64 `yaml:"multipart_threshold"`
@@ -59,8 +68,8 @@ type Config struct {
 // per-object adjustment that keeps an upload under 10 000 parts only grows
 // an already-valid part size, so it is not a reason to silently raise a
 // value the operator chose.
-const MinMultipartPartSize int64 = 5 << 20
-const MaxMultipartPartSize int64 = 5 << 30
+const MinMultipartPartSize int64 = 5 * 1024 * 1024
+const MaxMultipartPartSize int64 = 5 * 1024 * 1024 * 1024
 
 // Load parses YAML, applies env overrides and defaults. It does not require
 // every field: each command validates what it needs.
@@ -70,8 +79,14 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config %s: copy config.example.yaml first: %w", path, err)
 	}
 	c := &Config{}
-	if err := yaml.Unmarshal(b, c); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("config must contain exactly one YAML document")
 	}
 	if err := c.applyEnv(); err != nil {
 		return nil, err
@@ -98,10 +113,19 @@ func (c *Config) applyEnv() error {
 	c.Old.AccessKey = envOr(c.Old.AccessKey, "OLD_AK")
 	c.Old.SecretKey = envOr(c.Old.SecretKey, "OLD_SK")
 	c.Old.Region = envOr(c.Old.Region, "OLD_REGION")
+	c.Old.SessionToken = envOr(c.Old.SessionToken, "OLD_SESSION_TOKEN")
 	c.New.Endpoint = envOr(c.New.Endpoint, "NEW_ENDPOINT")
 	c.New.AccessKey = envOr(c.New.AccessKey, "NEW_AK")
 	c.New.SecretKey = envOr(c.New.SecretKey, "NEW_SK")
 	c.New.Region = envOr(c.New.Region, "NEW_REGION")
+	c.New.SessionToken = envOr(c.New.SessionToken, "NEW_SESSION_TOKEN")
+	if raw, set := os.LookupEnv("SOURCE_FROZEN"); set {
+		v, err := strconv.ParseBool(strings.TrimSpace(raw))
+		if err != nil {
+			return fmt.Errorf("SOURCE_FROZEN must be true or false")
+		}
+		c.SourceFrozen = v
+	}
 	sharedRegion := os.Getenv("REGION")
 	if sharedRegion != "" {
 		if c.Old.Region == "" {
@@ -191,6 +215,9 @@ func (c *Config) applyDefaults() {
 		c.MultipartConcurrency = DefaultMultipartConcurrency
 	}
 	// RateLimit 0 (omitted) stays 0: unlimited. Do not invent a default cap.
+	if c.SpoolMaxBytes == 0 {
+		c.SpoolMaxBytes = DefaultSpoolMaxBytes
+	}
 	if c.SpoolDir == "" {
 		c.SpoolDir = filepath.Dir(c.DBPath)
 	}
@@ -219,7 +246,7 @@ func (c *Config) validateMultipartPartSize() error {
 		return fmt.Errorf("multipart_part_size must be >= %d (5 MiB): non-final S3 parts smaller than that are rejected with EntityTooSmall (got %d)", MinMultipartPartSize, c.MultipartPartSize)
 	}
 	if c.MultipartPartSize > MaxMultipartPartSize {
-		return fmt.Errorf("multipart_part_size must be <= %d (5 GiB), got %d", MaxMultipartPartSize, c.MultipartPartSize)
+		return fmt.Errorf("multipart_part_size must be <= 5 GiB")
 	}
 	return nil
 }
@@ -231,11 +258,9 @@ func (c *Config) ValidateNames() error {
 	return ValidateBucketName(c.Bucket)
 }
 
-// ValidateBucketName also protects per-bucket filenames derived from a remote listing.
-func ValidateBucketName(bucket string) error {
-	if bucket == "" || bucket == "." || bucket == ".." || strings.ContainsAny(bucket, `/\:<>|"?*`) ||
-		strings.IndexFunc(bucket, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
-		return fmt.Errorf("invalid bucket name %q", bucket)
+func ValidateBucketName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\:<>|"?*`) || strings.ContainsFunc(name, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
+		return fmt.Errorf("bucket %q must not contain whitespace, control characters or path separators", name)
 	}
 	return nil
 }
@@ -243,16 +268,6 @@ func ValidateBucketName(bucket string) error {
 // AllBuckets reports whether the operator pinned no bucket (whole instance).
 func (c *Config) AllBuckets() bool {
 	return c.Bucket == ""
-}
-
-func validateEndpoint(label, endpoint string) error {
-	u, err := url.Parse(endpoint)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" ||
-		u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-		// Avoid echoing URLs that may include embedded credentials or signatures.
-		return fmt.Errorf("%s.endpoint must be an HTTP(S) URL with a host and no credentials, query or fragment", label)
-	}
-	return nil
 }
 
 // ValidateSource is required by list / scan.
@@ -263,7 +278,7 @@ func (c *Config) ValidateSource() error {
 	if c.Old.AccessKey == "" || c.Old.SecretKey == "" {
 		return fmt.Errorf("old.access_key and old.secret_key are required")
 	}
-	return validateEndpoint("old", c.Old.Endpoint)
+	return validateEndpoint(c.Old.Endpoint)
 }
 
 // ValidatePair is required by run / migrate / diff.
@@ -277,17 +292,51 @@ func (c *Config) ValidatePair() error {
 	if c.New.AccessKey == "" || c.New.SecretKey == "" {
 		return fmt.Errorf("new.access_key and new.secret_key are required")
 	}
-	return validateEndpoint("new", c.New.Endpoint)
+	if err := validateEndpoint(c.New.Endpoint); err != nil {
+		return err
+	}
+	if strings.EqualFold(c.Old.Endpoint, c.New.Endpoint) {
+		return fmt.Errorf("source and target endpoints must be different")
+	}
+	return nil
+}
+
+func validateEndpoint(endpoint string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("endpoint must be an absolute http or https URL")
+	}
+	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("endpoint must not contain credentials, a query or a fragment")
+	}
+	return nil
+}
+
+// ValidateMigration validates the conditions for commands that write objects.
+func (c *Config) ValidateMigration() error {
+	if err := c.ValidatePair(); err != nil {
+		return err
+	}
+	if !c.SourceFrozen {
+		return fmt.Errorf("migration requires frozen source writes and deletes; freeze the source, then set source_frozen: true or --source-frozen (this flag does not freeze S3)")
+	}
+	return nil
 }
 
 // ValidateConcurrency checks the knobs that size the worker pool and the
 // per-object part semaphore. Call it after defaults and again after CLI overrides.
 func (c *Config) ValidateConcurrency() error {
+	if c.SpoolMaxBytes < 0 {
+		return fmt.Errorf("spool_max_bytes must be positive")
+	}
 	if c.Workers < 1 {
 		return fmt.Errorf("workers must be >= 1, got %d", c.Workers)
 	}
 	if c.MultipartConcurrency < 1 {
 		return fmt.Errorf("multipart_concurrency must be >= 1, got %d", c.MultipartConcurrency)
+	}
+	if c.Workers > 1024 || c.MultipartConcurrency > 64 || c.Workers > 4096/c.MultipartConcurrency {
+		return fmt.Errorf("concurrency exceeds resource limits: workers <= 1024, multipart_concurrency <= 64, product <= 4096")
 	}
 	if c.MultipartThreshold < 1 {
 		return fmt.Errorf("multipart_threshold must be >= 1, got %d", c.MultipartThreshold)
@@ -376,12 +425,12 @@ func (c *Config) ApplyBucketFlag(flag string) {
 }
 
 // DBPathFor returns the state DB for one bucket. Single-bucket mode uses
-// db_path verbatim; all-buckets mode derives migration-<bucket>.db next to it.
+// db_path verbatim; all-buckets mode preserves the configured job basename.
 func (c *Config) DBPathFor(bucket string) string {
 	if !c.AllBuckets() {
 		return c.DBPath
 	}
-	return sibling(c.DBPath, "migration-"+bucket+".db")
+	return bucketPath(c.DBPath, bucket, ".db")
 }
 
 // ConflictLogFor follows the same rule as DBPathFor.
@@ -389,7 +438,16 @@ func (c *Config) ConflictLogFor(bucket string) string {
 	if !c.AllBuckets() {
 		return c.ConflictLog
 	}
-	return sibling(c.ConflictLog, "conflict-"+bucket+".log")
+	return bucketPath(c.ConflictLog, bucket, ".log")
+}
+
+func bucketPath(base, bucket, fallbackExt string) string {
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(filepath.Base(base), ext)
+	if ext == "" {
+		ext = fallbackExt
+	}
+	return sibling(base, stem+"-"+bucket+ext)
 }
 
 func sibling(base, name string) string {

@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README_ZH.md) | [Deutsch](README_DE.md) | [Español](README_ES.md) | [Français](README_FR.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | **Português** | [Русский](README_RU.md)
 
+**Importante: esta tradução está desatualizada.** Siga o [guia atual](docs/USAGE.md) e os [requisitos de segurança](README.md): congele externamente as escritas e eliminações na origem desde a leitura do inventário até à validação e coordene as eliminações no destino. `--source-frozen` não congela nada automaticamente. Verifique as escritas condicionais e não aceite apenas o código de saída 0 como prova de conclusão.
+
 O `migration` copia a versão atual dos objetos entre dois clusters compatíveis com S3. Por exemplo, pode transferir o histórico de um cluster RustFS ou MinIO enquanto a aplicação já escreve no novo cluster. Na configuração, `old` identifica a origem e `new` o destino. Ambos usam endereços S3 com o nome do bucket no caminho.
 
 A ferramenta copia as chaves em falta, regista os conflitos em `conflict.log` e guarda o progresso numa base de dados SQLite local. Nenhum objeto é eliminado. O destino tem de respeitar `If-None-Match: *` nas operações `PutObject` e `CompleteMultipartUpload`. Assim, mesmo que a aplicação crie a chave depois da verificação inicial, o objeto fica protegido.

@@ -77,16 +77,13 @@ rate_limit: 0
 		t.Fatalf("list exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
 
-	// Reading status before the first scan must not create an inventory.
+	// Read-only status must not manufacture a successful empty inventory.
 	stdout, stderr, code = runBin(t, bin, "status", "-c", cfgPath)
-	if code != 0 {
-		t.Fatalf("status before scan exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
-	}
-	if !strings.Contains(stdout, "no state DBs") {
-		t.Fatalf("status before scan: %s", stdout)
+	if code == 0 {
+		t.Fatalf("status before scan unexpectedly succeeded\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "migration.db")); !os.IsNotExist(err) {
-		t.Fatalf("status created a database, stat err=%v", err)
+		t.Fatalf("status created an inventory before scan: %v", err)
 	}
 
 	if _, stderr, code = runBin(t, bin, "scan", "-c", cfgPath); code != 0 {

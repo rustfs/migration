@@ -52,6 +52,7 @@ def exercise(binary, directory, old, new):
     dst, dst_config = new
     config = {
         "old": src_config, "new": dst_config, "workers": 2,
+        "source_frozen": True,
         "multipart_threshold": 5 * MIB, "multipart_part_size": 5 * MIB,
         "multipart_concurrency": 2,
     }
@@ -87,6 +88,10 @@ def exercise(binary, directory, old, new):
 
     assert empty_bucket in cli("list")
     cli("scan")
+    # The flag is only an assertion; rejecting a false assertion prevents writes.
+    cli("migrate", "--source-frozen=false", exit_code=1)
+    assert not dst.list_objects_v2(Bucket=bucket).get("Contents"), "freeze guard wrote objects"
+    assert empty_bucket not in {item["Name"] for item in dst.list_buckets()["Buckets"]}, "freeze guard created a bucket"
     cli("migrate")
     dst.head_bucket(Bucket=empty_bucket)
     for key, expected in bodies.items():
@@ -95,9 +100,10 @@ def exercise(binary, directory, old, new):
             assert body.read() == expected, f"incorrect bytes for {key!r}"
         for field, value in attrs.items():
             assert got[field] == value, f"{key!r}: incorrect {field}: {got[field]!r}"
-    assert "-2" in dst.head_object(Bucket=bucket, Key="large.bin")["ETag"]
+    # ETags are opaque; exact bytes and metadata above are the correctness test.
+    assert dst.head_object(Bucket=bucket, Key="large.bin")["ETag"]
     initial_diff = cli("diff")
-    assert "ok=3" in initial_diff and "size_only=1" in initial_diff, initial_diff
+    assert "ok=3" in initial_diff and "content_mismatch=0" in initial_diff, initial_diff
 
     def versions():
         return sorted((v["Key"], v["VersionId"]) for v in
@@ -117,11 +123,18 @@ def exercise(binary, directory, old, new):
     with dst.get_object(Bucket=bucket, Key="changed")["Body"] as body:
         assert body.read() == b"later", "rescan did not retry the changed object"
 
-    src.put_object(Bucket=bucket, Key="conflict", Body=b"source")
-    dst.put_object(Bucket=bucket, Key="conflict", Body=b"target")
+    # Both objects have identical explicit metadata and size, so diff must
+    # compare their bytes rather than reporting a server-default header mismatch.
+    src.put_object(Bucket=bucket, Key="conflict", Body=b"source", **attrs)
+    dst.put_object(Bucket=bucket, Key="conflict", Body=b"target", **attrs)
+    for client in (src, dst):
+        head = client.head_object(Bucket=bucket, Key="conflict")
+        for field, value in attrs.items():
+            assert head[field] == value, f"conflict: incorrect {field}: {head.get(field)!r}"
     dst.put_object(Bucket=bucket, Key="extra", Body=b"target only")
     before_conflict = versions()
     cli("run")
+    cli("migrate", "--strict", exit_code=1)
     assert_status(5, 0, 4, 1, 0, 0)
     assert versions() == before_conflict, "conflict or target-only object was overwritten"
     for key, expected in {"conflict": b"target", "extra": b"target only"}.items():
@@ -152,8 +165,15 @@ def exercise(binary, directory, old, new):
     assert not dst.list_multipart_uploads(Bucket=bucket).get("Uploads")
     assert_status(6, 0, 4, 2, 0, 0)
 
-    gaps = cli("diff", "--extra", exit_code=1)
-    assert "etag_mismatch=1" in gaps and "size_mismatch=1" in gaps and "extra_on_target=1" in gaps, gaps
+    report = directory / "issues.jsonl"
+    gaps = cli("diff", "--strict", "--issues-jsonl", str(report), exit_code=1)
+    assert "content_mismatch=1" in gaps and "size_mismatch=1" in gaps and "extra_on_target=1" in gaps, gaps
+    issues = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+    assert {(issue["bucket"], issue["key"], issue["kind"]) for issue in issues} == {
+        (bucket, "conflict", "content"), (bucket, race_key, "size"), (bucket, "extra", "extra")
+    }, issues
+    # Explicitly breaking the source freeze above is adversarial fault injection;
+    # a production migration must keep the source frozen through final acceptance.
 
 
 def main():

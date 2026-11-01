@@ -38,7 +38,7 @@ func TestOpenRejectsEmptyBucket(t *testing.T) {
 	}
 }
 
-func TestUpsertNeverResurrectsDone(t *testing.T) {
+func TestUpsertPreservesUnchangedDone(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "t.db"), "photos")
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +52,6 @@ func TestUpsertNeverResurrectsDone(t *testing.T) {
 	if err := st.MarkStatus("k", StatusDone, ""); err != nil {
 		t.Fatal(err)
 	}
-	obj.Size = 2
 	if err := st.BatchUpsertScanned([]Object{obj}); err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +153,7 @@ func itoa2(i int) string {
 	return string([]byte{'0' + byte(i/10), '0' + byte(i%10)})
 }
 
-func TestLegacyInventoryBindsEndpointsWithoutLosingProgress(t *testing.T) {
+func TestLegacyInventoryRequiresRescanWithoutLosingProgress(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state#1.db")
 	st, err := Open(path, "photos")
 	if err != nil {
@@ -169,23 +168,18 @@ func TestLegacyInventoryBindsEndpointsWithoutLosingProgress(t *testing.T) {
 	if err := st.MarkStatus("old", StatusDone, ""); err != nil {
 		t.Fatal(err)
 	}
-	st.Close()
-	st, err = OpenInventory(path, "photos")
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if st, err = OpenInventory(path, "photos"); err == nil {
+		st.Close()
+		t.Fatal("legacy inventory without a scan certificate must not authorize migration")
+	}
+	st, err = OpenExisting(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if err := st.BindEndpoints("http://source", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.BindEndpoints("http://source", "http://target"); err != nil {
-		t.Fatal(err)
-	}
-	for _, pair := range [][2]string{{"http://other", "http://target"}, {"http://source", "http://other"}} {
-		if err := st.BindEndpoints(pair[0], pair[1]); err == nil {
-			t.Fatalf("accepted changed endpoint in %v", pair)
-		}
-	}
 	counts, err := st.Counts()
 	if err != nil || counts.Done != 1 {
 		t.Fatalf("lost existing state: %+v err=%v", counts, err)

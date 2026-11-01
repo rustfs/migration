@@ -181,7 +181,7 @@ func TestDiffReturnsTargetErrorWithFullQueue(t *testing.T) {
 	}
 }
 
-func TestDiffSeparatesSizeOnlyFromETagMatches(t *testing.T) {
+func TestDiffRejectsUnverifiableSameSizeObjects(t *testing.T) {
 	old := fakes3.NewWithObjects(t, "photos", map[string][]byte{
 		"ok": []byte("x"), "multipart": []byte("x"), "missing-tag": []byte("x"),
 	}, time.Now())
@@ -199,8 +199,8 @@ func TestDiffSeparatesSizeOnlyFromETagMatches(t *testing.T) {
 	defer target.Close()
 	ctx := context.Background()
 	res, err := Run(ctx, testClient(t, ctx, old.URL), testClient(t, ctx, target.URL), "photos", Options{Workers: 2})
-	if err != nil || res.OK != 3 || res.SizeOnly != 2 || res.HasGaps() {
-		t.Fatalf("result=%+v err=%v", res, err)
+	if err == nil && (!res.HasGaps() || res.OK != 0) {
+		t.Fatalf("unreadable target must not be certified: result=%+v", res)
 	}
 }
 

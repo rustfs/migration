@@ -136,7 +136,7 @@ func TestResumeAfterTransientFailure(t *testing.T) {
 		t.Fatalf("new migrator: %v", err)
 	}
 	if err := m1.Run(ctx); err == nil {
-		t.Fatal("run1 reported success despite a failed upload")
+		t.Fatal("migrate run1 must report the failed object")
 	}
 	_ = m1.Close()
 
@@ -367,6 +367,9 @@ func TestResumeAfterPutBeforeMarkDone(t *testing.T) {
 		ContentType: "application/test",
 		Metadata:    map[string]string{"origin": "old"},
 	})
+	if err := st.BindMigration(oldS3.URL, newS3.URL); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.MarkStatus("resume/a.dat", store.StatusFailed, "context canceled"); err != nil {
 		t.Fatal(err)
 	}
@@ -463,7 +466,7 @@ func TestCanceledMultipartGetIsFailedNotSkipped(t *testing.T) {
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("migrate: %v", err)
+			t.Fatalf("migrate cancellation: %v", err)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("migrate did not return after cancel")
@@ -814,6 +817,7 @@ func TestRunRejectsNonPositiveMultipart(t *testing.T) {
 func testCfg(db, conflict, spool string) *appconfig.Config {
 	return &appconfig.Config{
 		Bucket:               "bucket",
+		SourceFrozen:         true,
 		DBPath:               db,
 		ConflictLog:          conflict,
 		SpoolDir:             spool,
