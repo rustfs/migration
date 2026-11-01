@@ -123,8 +123,14 @@ def exercise(binary, directory, old, new):
     with dst.get_object(Bucket=bucket, Key="changed")["Body"] as body:
         assert body.read() == b"later", "rescan did not retry the changed object"
 
-    src.put_object(Bucket=bucket, Key="conflict", Body=b"source")
-    dst.put_object(Bucket=bucket, Key="conflict", Body=b"target")
+    # Both objects have identical explicit metadata and size, so diff must
+    # compare their bytes rather than reporting a server-default header mismatch.
+    src.put_object(Bucket=bucket, Key="conflict", Body=b"source", **attrs)
+    dst.put_object(Bucket=bucket, Key="conflict", Body=b"target", **attrs)
+    for client in (src, dst):
+        head = client.head_object(Bucket=bucket, Key="conflict")
+        for field, value in attrs.items():
+            assert head[field] == value, f"conflict: incorrect {field}: {head.get(field)!r}"
     dst.put_object(Bucket=bucket, Key="extra", Body=b"target only")
     before_conflict = versions()
     cli("run")

@@ -3,6 +3,7 @@ package store
 import (
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -20,7 +21,11 @@ func TestSQLiteURIWindowsPathFormatting(t *testing.T) {
 }
 
 func TestSQLiteURIPathSpecialCharactersAndWriterLock(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state #? % ü.db")
+	name := "state #? % ü.db"
+	if runtime.GOOS == "windows" {
+		name = "state # % ü.db" // Windows filenames cannot contain question marks.
+	}
+	path := filepath.Join(t.TempDir(), name)
 	writer, err := Open(path, "bucket")
 	if err != nil {
 		t.Fatal(err)
