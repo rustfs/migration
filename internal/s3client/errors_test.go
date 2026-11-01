@@ -72,8 +72,8 @@ func TestCanceledRequestIsNotSource404(t *testing.T) {
 	if !IsNotFound(&s3types.NotFound{}) {
 		t.Fatal("typed NotFound")
 	}
-	if !IsNotFound(errors.New("https response error StatusCode: 404, RequestID: z, NotFound")) {
-		t.Fatal("completed untyped 404")
+	if IsNotFound(errors.New("https response error StatusCode: 404, RequestID: z, NotFound")) {
+		t.Fatal("text without a structured HTTP response is not evidence of 404")
 	}
 	upload404 := fmt.Errorf("upload part 1: https response error StatusCode: 404, RequestID: r, HostID: h, %w", &s3types.NoSuchUpload{})
 	if IsNotFound(upload404) {
@@ -82,8 +82,8 @@ func TestCanceledRequestIsNotSource404(t *testing.T) {
 }
 
 func TestIsAlreadyExists(t *testing.T) {
-	if !IsAlreadyExists(&s3types.BucketAlreadyExists{}) {
-		t.Fatal("exists")
+	if IsAlreadyExists(&s3types.BucketAlreadyExists{}) {
+		t.Fatal("foreign bucket ownership must not be accepted")
 	}
 	if !IsAlreadyExists(&s3types.BucketAlreadyOwnedByYou{}) {
 		t.Fatal("owned")

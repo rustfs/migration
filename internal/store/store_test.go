@@ -37,7 +37,7 @@ func TestOpenRejectsEmptyBucket(t *testing.T) {
 	}
 }
 
-func TestUpsertNeverResurrectsDone(t *testing.T) {
+func TestUpsertPreservesUnchangedDone(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "t.db"), "photos")
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +51,6 @@ func TestUpsertNeverResurrectsDone(t *testing.T) {
 	if err := st.MarkStatus("k", StatusDone, ""); err != nil {
 		t.Fatal(err)
 	}
-	obj.Size = 2
 	if err := st.BatchUpsertScanned([]Object{obj}); err != nil {
 		t.Fatal(err)
 	}

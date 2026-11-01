@@ -1,49 +1,53 @@
-# migration — English usage (short)
+# Migration usage
 
-The operator manual is in Chinese: [使用手册.md](./使用手册.md).
-The README has the same commands in both languages.
+Use a frozen source: stop source writes and deletes, including lifecycle deletion, until final verification and cutover complete. `--source-frozen` acknowledges this external action; it does not lock S3. Uncoordinated dual-cluster deletes are unsupported. Business deletes of inventory keys on the target must also be paused or coordinated through tombstones; freezing only source DELETE requests is insufficient.
 
-```bash
+The target must support atomic `If-None-Match: *` on PutObject and CompleteMultipartUpload. Verify your actual server version before production use. The tool never calls DeleteObject or CopyObject.
+
+```sh
+go build -o bin/migration .
 cp config.example.yaml config.yaml
-./bin/migration --help
-./bin/migration run  -c config.yaml --workers 16 --rate-limit 20M
+# Set endpoints, credentials and an independent state directory.
+# Freeze source mutations externally, then:
+./bin/migration run -c config.yaml --source-frozen --workers 16 --rate-limit 20M
+./bin/migration status -c config.yaml
 ./bin/migration diff -c config.yaml
 ```
 
-- Empty `bucket:` migrates every source bucket. `--bucket NAME` pins one.
-- `run` = scan + copy. `scan` / `migrate` stay available separately.
-- `scan` is single-threaded. `--workers` does not speed it up.
-- `--workers` (env `WORKERS`, default 16) is how many objects `run` / `migrate` copy at once, and how many keys `diff` HEADs at once.
-- `--multipart-concurrency` (env `MULTIPART_CONCURRENCY`, default 4) is how many parts of **one** large object upload together.
-- `--rate-limit` (env `RATE_LIMIT`, YAML `rate_limit`, default unlimited) is the aggregate bytes per second those workers may read from the source. `20M` / `20MB` = 20×1000×1000 B/s. `20Mi` / `20MiB` = 20×1024×1024 B/s. `0` or omit means unlimited at every layer.
-- Priority: CLI > environment > YAML > default. For the concurrency knobs, `0` in YAML means "default". A negative value, or an explicit `0` on the CLI or in the environment, is an error. For `rate_limit`, `0` is unlimited everywhere.
-- Peak HTTP per cluster is about `workers × multipart_concurrency`.
-- `diff` HEADs the target for every source key and exits 1 when anything is missing or mismatched. It never uploads.
-- Never overwrites. Never deletes. The first Ctrl-C cancels the pool; `migrate` resumes from SQLite. A second signal exits 130.
-- A target object that already matches the inventory (same size; same ETag when both are present and neither is a multipart ETag `hash-N`) is marked `done`, not `conflict`. A different size or comparable ETag is still a conflict and is never overwritten. A Ctrl-C after a successful PUT therefore resumes as `done` instead of a false conflict.
-- `skipped` is only a source 404 / NoSuchKey from a request that finished. `context.Canceled`, `context.DeadlineExceeded`, and `request canceled` are `failed` (the next `migrate` retries them), even when the error text also contains `NotFound` or `StatusCode: 404`.
-- `multipart_part_size` must be at least 5 MiB (5242880). S3 rejects a smaller non-final part with `EntityTooSmall`. The 16 MiB default is unchanged. A smaller configured value fails at config load and is not clamped upward.
+Build with Go 1.26+; go.mod selects the patched go1.26.10 toolchain. Configuration precedence is CLI, environment, YAML, defaults. Unknown YAML fields fail. Source and target support session_token / OLD_SESSION_TOKEN / NEW_SESSION_TOKEN for temporary credentials.
 
-## Limiting load
+`scan` inventories objects and records a completed scan generation. `migrate --source-frozen` retries pending/failed objects only after a complete scan. `run` does both. `list` and `status` do not transfer object bodies.
 
-`--rate-limit` (env `RATE_LIMIT`, YAML `rate_limit`) caps aggregate source-read bytes per second across every copy worker. `20M` is 20×1000×1000 B/s. `0` or omit is unlimited. Request fan-out is still concurrency:
+Every copied object is read back from the destination and checked with SHA-256. An existing same-size object is only done after full source/target digest comparison; different bytes or metadata remain conflicts. ETags are opaque conditional-read tokens, not assumed MD5 checksums. Missing identity or unreadable content fails verification.
 
-| Field | Meaning | Default |
-| --- | --- | --- |
-| `workers` | Objects copied at once. Also the HEAD concurrency for `diff`. | 16 |
-| `multipart_concurrency` | Parallel parts of one large object (`run` / `migrate` only). | 4 |
-| `rate_limit` | Shared source-read cap for `run` / `migrate` object bodies. | unlimited |
+`diff` verifies bucket existence, object sizes and full-body SHA-256, and compares preserved metadata. It requires read permissions on both sides and consumes read bandwidth. `--extra` additionally reports target-only keys without treating them as a migration failure. The rate limit applies to source body reads in run/migrate, including the extra full-source digest pass used by multipart copies; it does not limit diff or destination reads/writes.
 
-Peak in-flight requests are about `workers × multipart_concurrency`. The default `16 × 4` can still exhaust HAProxy `maxconn` even when `rate_limit` is set, because the cap counts bytes, not connections.
+For an automated gate, `run --strict` and `migrate --strict` return an error if the state contains any pending, failed, conflict or skipped objects, including outcomes from earlier runs. `diff --strict` also checks target-only objects and fails when any exist. Strict mode does not replace a freeze window or final content verification.
 
-To protect production, start with `--rate-limit 20M` (or `30M` / `50M`). If the proxy returns 503, lower `workers` first, then `multipart_concurrency` for large objects. Watch `migration status` and the NIC (`status` does not call S3).
+`diff --issues-jsonl /path/to/new-file.jsonl` streams all issues as JSON lines containing bucket, key, kind and detail. It refuses to overwrite an existing file. Include `--extra` or `--strict` to record target-only keys. An error or interruption can leave a partial file, so check the command result before treating it as complete.
 
-```yaml
-# Starting point for a lighter run. Adjust after watching status and the NIC.
-workers: 2
-multipart_concurrency: 2
+Errors, partial scans and cancellation return nonzero. Review conflicts and skipped source keys even when a copy command exits successfully; only an independently reviewed final verification is a cutover gate.
+
+State binds source/target endpoints and bucket. Do not repoint a state DB to another cluster. Legacy unbound state with processed rows is rejected: choose a new state directory, rescan and let the tool verify existing target objects. All-bucket mode preserves your basename: job-a.db becomes job-a-photos.db. A process lock prevents concurrent writers while status is read-only. Keep DB, WAL and lock files intact while running.
+
+Parts spool to disk with strict range and length checks. `spool_max_bytes` defaults to 1 GiB and bounds concurrent reservations in one migration, including one extra byte per file for length checks. A single object or part larger than the budget fails; increase the budget or reduce the part size/threshold. This is not a disk quota: files left by crashes, other processes, and other directory contents are excluded. After confirming no jobs are active, manually clean stale files from a dedicated spool directory; monitor free space. Resume retries whole objects; interrupted uploads after SIGKILL require the target's incomplete-multipart lifecycle cleanup. Source changes invalidate inventory rows and may produce conflicts; this is not continuous synchronization.
+
+Only current object data, common content headers and user metadata are migrated. Versions, delete markers, bucket policies, tags, ACLs, storage class, Object Lock, retention/legal hold and source encryption settings are outside scope.
+
+## Testing an explicit RustFS release
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+python3 scripts/audit-local-rustfs.py \
+  --rustfs-binary /absolute/path/rustfs --expect-version 1.0.4
 ```
 
-To go faster when the link has headroom: raise `workers` for many small objects, or raise `multipart_concurrency` / lower `multipart_part_size` (bytes, default 16 MiB, minimum 5 MiB; a smaller value fails at load and is not raised) for a single large object.
+Replace `/absolute/path/rustfs` with the absolute path to the release executable. Before starting either node, the launcher runs that exact file with `--version` and requires an exact match with `1.0.4`. It never falls back to a RustFS executable found on PATH. Both isolated loopback nodes use the verified file, and their processes and temporary data are cleaned up afterward.
 
-Safety, the state machine, tuning, and troubleshooting: see the Chinese manual and `docs/DESIGN.md`.
+The launcher records the executable path, version output and binary SHA-256 in `audit-results/rustfs-1.0.4/rustfs-binary.json`, with node logs beside it; `--output-dir` selects another evidence directory. The separate `real_s3` suite includes full-content verification and interrupted multipart migration followed by recovery from reopened SQLite. These are test scenarios, not a claim that this release has passed. Actual results must be recorded after running the suite against the identified binary.
+
+Earlier results for `1.0.0-alpha.61` remain historical evidence for that release only. They do not establish either success or failure for `1.0.4`.
+
+See [README](../README.md) for configuration, tuning and limits, [design](DESIGN.md) for implementation, and [fix validation](FIXES-2026-10-29.md) for the tested version and remaining compatibility constraints.

@@ -3,8 +3,10 @@ package s3client
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"time"
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -37,9 +39,9 @@ func NewWithPool(ctx context.Context, ep config.Endpoint, idlePerHost int) (*s3.
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(ep.Region),
 		awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(ep.AccessKey, ep.SecretKey, ""),
+			credentials.NewStaticCredentialsProvider(ep.AccessKey, ep.SecretKey, ep.SessionToken),
 		),
-		awsconfig.WithHTTPClient(&http.Client{Transport: pooledTransport(idlePerHost)}),
+		awsconfig.WithHTTPClient(&http.Client{Transport: idleTimeoutTransport{base: pooledTransport(idlePerHost), timeout: 90 * time.Second}}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("aws config: %w", err)
@@ -48,6 +50,10 @@ func NewWithPool(ctx context.Context, ep config.Endpoint, idlePerHost int) (*s3.
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = awsv2.String(ep.Endpoint)
 		o.UsePathStyle = true
+		// Avoid assuming optional checksum extensions on S3-compatible servers.
+		// Migration and diff verify full SHA-256 content independently.
+		o.RequestChecksumCalculation = awsv2.RequestChecksumCalculationWhenRequired
+		o.ResponseChecksumValidation = awsv2.ResponseChecksumValidationWhenRequired
 	})
 	return client, nil
 }
@@ -69,6 +75,23 @@ func pooledTransport(idlePerHost int) *http.Transport {
 		tr = &http.Transport{}
 	}
 	tr.MaxIdleConnsPerHost = idlePerHost
+	tr.ResponseHeaderTimeout = 30 * time.Second
+	// HTTP/1 gives each upload its own connection write deadline. HTTP/2
+	// stream flow-control waits cannot be bounded by a socket WriteDeadline.
+	tr.ForceAttemptHTTP2 = false
+	tr.Protocols = new(http.Protocols)
+	tr.Protocols.SetHTTP1(true)
+	dial := tr.DialContext
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	}
+	tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dial(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &writeTimeoutConn{Conn: conn, timeout: 90 * time.Second}, nil
+	}
 	if tr.MaxIdleConns < idlePerHost*2 {
 		tr.MaxIdleConns = idlePerHost * 2
 	}

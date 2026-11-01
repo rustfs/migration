@@ -52,9 +52,8 @@ func IsCanceled(err error) bool {
 // 404s (NoSuchBucket) across the typed and untyped shapes aws-sdk-go-v2
 // returns against self-hosted S3 implementations.
 //
-// Cancellation is rejected first, on purpose. The substring checks below
-// ("NotFound", "StatusCode: 404") are how a canceled request was recorded
-// as a source miss. NoSuchUpload is an upload-id 404, not a missing object.
+// Only structured API codes or an actual HTTP response are evidence of a 404.
+// Object keys and proxy messages in error text must never authorize a write.
 func IsNotFound(err error) bool {
 	if err == nil || IsCanceled(err) {
 		return false
@@ -77,23 +76,14 @@ func IsNotFound(err error) bool {
 		case "NoSuchKey", "NotFound", "NoSuchBucket", "404":
 			return true
 		case "":
-			// Untyped body; fall through to the message heuristics.
+			// A HEAD response may have no body or API code.
 		default:
 			// Completed response for some other code, such as NoSuchUpload.
 			return false
 		}
 	}
-	msg := err.Error()
-	if strings.Contains(msg, "NoSuchUpload") &&
-		!strings.Contains(msg, "NoSuchKey") &&
-		!strings.Contains(msg, "NoSuchBucket") &&
-		!strings.Contains(msg, "NotFound") {
-		return false
-	}
-	return strings.Contains(msg, "NoSuchKey") ||
-		strings.Contains(msg, "NoSuchBucket") ||
-		strings.Contains(msg, "NotFound") ||
-		strings.Contains(msg, "StatusCode: 404")
+	var response interface{ HTTPStatusCode() int }
+	return errors.As(err, &response) && response.HTTPStatusCode() == 404
 }
 
 // IsAlreadyExists matches CreateBucket when the bucket is already there.
@@ -105,14 +95,10 @@ func IsAlreadyExists(err error) bool {
 	if errors.As(err, &owned) {
 		return true
 	}
-	var exists *s3types.BucketAlreadyExists
-	if errors.As(err, &exists) {
-		return true
-	}
 	var ae smithy.APIError
 	if errors.As(err, &ae) {
 		switch ae.ErrorCode() {
-		case "BucketAlreadyOwnedByYou", "BucketAlreadyExists":
+		case "BucketAlreadyOwnedByYou":
 			return true
 		}
 	}

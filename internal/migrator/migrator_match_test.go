@@ -1,101 +1,80 @@
 package migrator
 
 import (
+	"bytes"
+	"context"
+	"github.com/rustfs/migration/internal/fakes3"
+	"net/http"
+	"net/http/httptest"
 	"testing"
-
-	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-
-	"github.com/rustfs/migration/internal/store"
 )
 
-func TestTargetAlreadyMigrated(t *testing.T) {
-	const etag = "aadd3e6a955c4a99024ca0bf126144a9"
-	cases := []struct {
-		name string
-		obj  store.Object
-		head *s3.HeadObjectOutput
-		want bool
+// ETags are concurrency tokens. A different multipart/encryption ETag is not
+// itself a content conflict, and an equal ETag is never proof of equality.
+func TestExistingTargetRequiresVerifiedBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		source, target         []byte
+		etag                   string
+		done, conflict, failed int64
 	}{
-		{
-			name: "identical quoted etag",
-			obj:  store.Object{Size: 1024, ETag: `"` + etag + `"`},
-			head: headOf(1024, `"`+etag+`"`),
-			want: true,
-		},
-		{
-			name: "quotes only on inventory",
-			obj:  store.Object{Size: 1024, ETag: `"` + etag + `"`},
-			head: headOf(1024, etag),
-			want: true,
-		},
-		{
-			name: "same size different etag",
-			obj:  store.Object{Size: 1024, ETag: etag},
-			head: headOf(1024, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-			want: false,
-		},
-		{
-			name: "different size same etag",
-			obj:  store.Object{Size: 1024, ETag: etag},
-			head: headOf(1025, etag),
-			want: false,
-		},
-		{
-			name: "multipart dest etag is not comparable",
-			obj:  store.Object{Size: 1024, ETag: etag},
-			head: headOf(1024, etag+"-3"),
-			want: true,
-		},
-		{
-			name: "both multipart etags differ",
-			obj:  store.Object{Size: 4096, ETag: etag + "-2"},
-			head: headOf(4096, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-4"),
-			want: true,
-		},
-		{
-			name: "missing etags match on size",
-			obj:  store.Object{Size: 8},
-			head: headOf(8, ""),
-			want: true,
-		},
-		{
-			name: "one missing etag matches on size",
-			obj:  store.Object{Size: 8, ETag: etag},
-			head: headOf(8, ""),
-			want: true,
-		},
-		{
-			name: "zero byte identical",
-			obj:  store.Object{Size: 0, ETag: "d41d8cd98f00b204e9800998ecf8427e"},
-			head: headOf(0, `"d41d8cd98f00b204e9800998ecf8427e"`),
-			want: true,
-		},
-		{
-			name: "nil head",
-			obj:  store.Object{Size: 1, ETag: "a"},
-			head: nil,
-			want: false,
-		},
-		{
-			name: "missing content length",
-			obj:  store.Object{Size: 4, ETag: "abcd"},
-			head: &s3.HeadObjectOutput{ETag: awsv2.String("abcd")},
-			want: false,
-		},
-	}
-	for _, tc := range cases {
+		{"same-content-opaque-etag", []byte("same"), []byte("same"), "opaque-encrypted-value", 1, 0, 0},
+		{"same-content-multipart-etag", []byte("same"), []byte("same"), "digest-2", 1, 0, 0},
+		{"same-content-quoted-etag", []byte("same"), []byte("same"), `"quoted-value"`, 1, 0, 0},
+		{"different-content-same-size", []byte("AAAA"), []byte("BBBB"), "opaque", 0, 1, 0},
+		{"different-size", []byte("longer"), []byte("short"), "opaque", 0, 1, 0},
+		{"missing-target-etag", []byte("same"), []byte("same"), "", 0, 0, 1},
+		{"zero-byte", []byte{}, []byte{}, "empty-object-etag", 1, 0, 0},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := targetAlreadyMigrated(tc.obj, tc.head); got != tc.want {
-				t.Fatalf("targetAlreadyMigrated() = %v, want %v", got, tc.want)
+			source := auditServer(t, map[string][]byte{"key": tc.source})
+			target := auditServer(t, map[string][]byte{"key": tc.target})
+			url := auditETagEndpoint(t, target, tc.etag)
+			m, st := auditMigration(t, source.URL, url)
+			err := m.Run(context.Background())
+			if (err != nil) != (tc.failed != 0) {
+				t.Fatalf("unexpected run error: %v", err)
+			}
+			counts, err := st.Counts()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if counts.Done != tc.done || counts.Conflict != tc.conflict || counts.Failed != tc.failed {
+				t.Fatalf("counts=%+v", counts)
+			}
+			got, _ := target.Object("bucket", "key")
+			if !bytes.Equal(got, tc.target) || target.PutObjectCalls("key") != 0 {
+				t.Fatal("existing target was modified")
 			}
 		})
 	}
 }
 
-func headOf(size int64, etag string) *s3.HeadObjectOutput {
-	return &s3.HeadObjectOutput{
-		ContentLength: awsv2.Int64(size),
-		ETag:          awsv2.String(etag),
-	}
+// Override the fixture's MD5-shaped ETags to model an endpoint with opaque
+// representation tags, while still enforcing the requested If-Match token.
+func auditETagEndpoint(t *testing.T, target *fakes3.Server, etag string) string {
+	t.Helper()
+	return auditWrap(t, target, func(w http.ResponseWriter, r *http.Request, next http.Handler) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if match := r.Header.Get("If-Match"); match != "" && match != etag {
+			auditError(w, http.StatusPreconditionFailed, "PreconditionFailed")
+			return
+		}
+		r.Header.Del("If-Match")
+		recorded := httptest.NewRecorder()
+		next.ServeHTTP(recorded, r)
+		for key, values := range recorded.Header() {
+			w.Header()[key] = values
+		}
+		if etag == "" {
+			w.Header().Del("ETag")
+		} else {
+			w.Header().Set("ETag", etag)
+		}
+		w.WriteHeader(recorded.Code)
+		_, _ = w.Write(recorded.Body.Bytes())
+	})
 }
