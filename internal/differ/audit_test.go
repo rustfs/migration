@@ -10,6 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -404,5 +407,61 @@ func TestDecodeKeyHandlesBothSpaceEncodings(t *testing.T) {
 		if err != nil || got != "space and+plus%" {
 			t.Fatalf("%q decoded to %q: %v", encoded, got, err)
 		}
+	}
+}
+
+func TestDiffTempDirWithQueryAndHashCharacters(t *testing.T) {
+	dirName := "tmp #? % dir"
+	if runtime.GOOS == "windows" {
+		dirName = "tmp # % dir"
+	}
+	specialTmp := filepath.Join(t.TempDir(), dirName)
+	if err := os.MkdirAll(specialTmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", specialTmp)
+	t.Setenv("TMP", specialTmp)
+	t.Setenv("TEMP", specialTmp)
+
+	src := fakes3.NewWithObjects(t, "bucket", map[string][]byte{"k": []byte("v")}, time.Now())
+	defer src.Close()
+	dst := fakes3.NewWithObjects(t, "bucket", map[string][]byte{"k": []byte("v"), "extra": []byte("v")}, time.Now())
+	defer dst.Close()
+
+	ctx := context.Background()
+	res, err := Run(ctx, testClient(t, ctx, src.URL), testClient(t, ctx, dst.URL), "bucket", Options{Workers: 1, ReportExtra: true})
+	if err != nil {
+		t.Fatalf("Run failed with special TMPDIR: %v", err)
+	}
+	if res.OK != 1 || res.Extra != 1 {
+		t.Fatalf("unexpected diff result: %+v", res)
+	}
+	entries, err := os.ReadDir(specialTmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temp db files were not cleaned up in %s: %v", specialTmp, entries)
+	}
+}
+
+func TestRunExtraBucketReportsNonEmptyAndEmptyBuckets(t *testing.T) {
+	now := time.Now()
+	dst := fakes3.NewWithObjects(t, "non-empty", map[string][]byte{"a": []byte("1"), "b": []byte("2")}, now)
+	defer dst.Close()
+	dst.Put("empty-extra", "seed", []byte("1"), now, fakes3.Metadata{})
+	dst.DeleteKey("empty-extra", "seed")
+
+	ctx := context.Background()
+	cli := testClient(t, ctx, dst.URL)
+
+	res1, err := RunExtraBucket(ctx, cli, "non-empty", Options{ReportExtra: true})
+	if err != nil || res1.Extra != 2 || len(res1.Issues) != 2 {
+		t.Fatalf("non-empty extra bucket: res=%+v err=%v", res1, err)
+	}
+
+	res2, err := RunExtraBucket(ctx, cli, "empty-extra", Options{ReportExtra: true})
+	if err != nil || res2.Extra != 1 || len(res2.Issues) != 1 || res2.Issues[0].Key != "" {
+		t.Fatalf("empty extra bucket: res=%+v err=%v", res2, err)
 	}
 }

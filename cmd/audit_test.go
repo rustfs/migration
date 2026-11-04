@@ -263,3 +263,76 @@ func TestAllBucketStatusRejectsMissingInventory(t *testing.T) {
 		t.Fatalf("empty all-bucket status must report missing inventory: %v", err)
 	}
 }
+
+func TestSubcommandsRejectUnexpectedPositionalArgs(t *testing.T) {
+	path := writeTestConfig(t)
+	for _, sub := range []string{"list", "run", "scan", "migrate", "diff", "status"} {
+		t.Run(sub, func(t *testing.T) {
+			_, err := execRoot(t, sub, "-c", path, "unexpected-bucket-arg")
+			if err == nil || !strings.Contains(err.Error(), "unknown command") {
+				t.Fatalf("%s accepted positional arg: %v", sub, err)
+			}
+		})
+	}
+}
+
+func TestCLIOverridesBeatInvalidEnvAndYAML(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	body := `
+old: {endpoint: "http://127.0.0.1:9", access_key: a, secret_key: b}
+new: {endpoint: "http://127.0.0.1:8", access_key: c, secret_key: d}
+bucket: "INVALID_BUCKET_NAME"
+workers: 9999
+multipart_concurrency: 9999
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BUCKET", "ALSO_INVALID_BUCKET")
+	t.Setenv("WORKERS", "not-an-int")
+	t.Setenv("MULTIPART_CONCURRENCY", "0")
+	t.Setenv("RATE_LIMIT", "-50")
+	t.Setenv("SOURCE_FROZEN", "not-a-bool")
+
+	cfg, err := withStatusConfig(t, []string{
+		"status", "-c", path,
+		"--bucket", "photos",
+		"--workers", "8",
+		"--multipart-concurrency", "4",
+		"--rate-limit", "10MB",
+		"--source-frozen=true",
+	})
+	if err != nil {
+		t.Fatalf("CLI flags should override invalid env/YAML values: %v", err)
+	}
+	if cfg.Bucket != "photos" || cfg.Workers != 8 || cfg.MultipartConcurrency != 4 || int64(cfg.RateLimit) != 10_000_000 || !cfg.SourceFrozen {
+		t.Fatalf("unexpected resolved config: %+v", cfg)
+	}
+}
+
+func TestAllBucketDiffDetectsTargetOnlyBuckets(t *testing.T) {
+	now := time.Now()
+	source := fakes3.NewWithObjects(t, "shared", map[string][]byte{"a.txt": []byte("ok")}, now)
+	defer source.Close()
+
+	target := fakes3.NewWithObjects(t, "shared", map[string][]byte{"a.txt": []byte("ok")}, now)
+	defer target.Close()
+	target.Put("rogue-bucket", "rogue.txt", []byte("extra-data"), now, fakes3.Metadata{})
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	writeClusterConfig(t, cfgPath, source.URL, target.URL, filepath.Join(dir, "migration.db"), filepath.Join(dir, "conflict.log"), dir, "workers: 2\n")
+
+	jsonlPath := filepath.Join(dir, "issues.jsonl")
+	if _, err := execRoot(t, "diff", "-c", cfgPath, "--strict", "--issues-jsonl", jsonlPath); err == nil || !strings.Contains(err.Error(), "rogue-bucket") {
+		t.Fatalf("all-bucket diff --strict must fail on target-only bucket, got %v", err)
+	}
+	raw, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"bucket":"rogue-bucket"`) || !strings.Contains(string(raw), `"key":"rogue.txt"`) {
+		t.Fatalf("expected rogue-bucket issue in JSONL, got %s", string(raw))
+	}
+}

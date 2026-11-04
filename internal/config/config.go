@@ -71,28 +71,20 @@ type Config struct {
 const MinMultipartPartSize int64 = 5 * 1024 * 1024
 const MaxMultipartPartSize int64 = 5 * 1024 * 1024 * 1024
 
+type CLIReadOptions struct {
+	SkipWorkersEnv              bool
+	SkipMultipartConcurrencyEnv bool
+	SkipRateLimitEnv            bool
+	SkipSourceFrozenEnv         bool
+}
+
 // Load parses YAML, applies env overrides and defaults. It does not require
 // every field: each command validates what it needs.
 func Load(path string) (*Config, error) {
-	b, err := os.ReadFile(path)
+	c, err := LoadForCLI(path, CLIReadOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("read config %s: copy config.example.yaml first: %w", path, err)
-	}
-	c := &Config{}
-	dec := yaml.NewDecoder(bytes.NewReader(b))
-	dec.KnownFields(true)
-	if err := dec.Decode(c); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
-		return nil, fmt.Errorf("config must contain exactly one YAML document")
-	}
-	if err := c.applyEnv(); err != nil {
 		return nil, err
 	}
-	c.applyDefaults()
-	c.normalize()
 	if err := c.ValidateNames(); err != nil {
 		return nil, err
 	}
@@ -108,7 +100,41 @@ func Load(path string) (*Config, error) {
 	return c, nil
 }
 
+// LoadForCLI parses YAML, applies env overrides (skipping any env vars whose
+// corresponding CLI flag was explicitly set) and defaults, and validates fields
+// that cannot be overridden by CLI flags. Callers must apply CLI overrides and
+// then validate names, concurrency and rate limit.
+func LoadForCLI(path string, opt CLIReadOptions) (*Config, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: copy config.example.yaml first: %w", path, err)
+	}
+	c := &Config{}
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(c); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("config must contain exactly one YAML document")
+	}
+	if err := c.applyEnvWithOptions(opt); err != nil {
+		return nil, err
+	}
+	c.applyDefaults()
+	c.normalize()
+	if err := c.validateMultipartPartSize(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
 func (c *Config) applyEnv() error {
+	return c.applyEnvWithOptions(CLIReadOptions{})
+}
+
+func (c *Config) applyEnvWithOptions(opt CLIReadOptions) error {
 	c.Old.Endpoint = envOr(c.Old.Endpoint, "OLD_ENDPOINT")
 	c.Old.AccessKey = envOr(c.Old.AccessKey, "OLD_AK")
 	c.Old.SecretKey = envOr(c.Old.SecretKey, "OLD_SK")
@@ -119,12 +145,14 @@ func (c *Config) applyEnv() error {
 	c.New.SecretKey = envOr(c.New.SecretKey, "NEW_SK")
 	c.New.Region = envOr(c.New.Region, "NEW_REGION")
 	c.New.SessionToken = envOr(c.New.SessionToken, "NEW_SESSION_TOKEN")
-	if raw, set := os.LookupEnv("SOURCE_FROZEN"); set {
-		v, err := strconv.ParseBool(strings.TrimSpace(raw))
-		if err != nil {
-			return fmt.Errorf("SOURCE_FROZEN must be true or false")
+	if !opt.SkipSourceFrozenEnv {
+		if raw, set := os.LookupEnv("SOURCE_FROZEN"); set {
+			v, err := strconv.ParseBool(strings.TrimSpace(raw))
+			if err != nil {
+				return fmt.Errorf("SOURCE_FROZEN must be true or false")
+			}
+			c.SourceFrozen = v
 		}
-		c.SourceFrozen = v
 	}
 	sharedRegion := os.Getenv("REGION")
 	if sharedRegion != "" {
@@ -139,14 +167,20 @@ func (c *Config) applyEnv() error {
 	c.DBPath = envOr(c.DBPath, "DB_PATH")
 	c.ConflictLog = envOr(c.ConflictLog, "CONFLICT_LOG")
 	c.SpoolDir = envOr(c.SpoolDir, "SPOOL_DIR")
-	if err := applyPositiveIntEnv(&c.Workers, "WORKERS"); err != nil {
-		return err
+	if !opt.SkipWorkersEnv {
+		if err := applyPositiveIntEnv(&c.Workers, "WORKERS"); err != nil {
+			return err
+		}
 	}
-	if err := applyPositiveIntEnv(&c.MultipartConcurrency, "MULTIPART_CONCURRENCY"); err != nil {
-		return err
+	if !opt.SkipMultipartConcurrencyEnv {
+		if err := applyPositiveIntEnv(&c.MultipartConcurrency, "MULTIPART_CONCURRENCY"); err != nil {
+			return err
+		}
 	}
-	if err := applyByteRateEnv(&c.RateLimit, "RATE_LIMIT"); err != nil {
-		return err
+	if !opt.SkipRateLimitEnv {
+		if err := applyByteRateEnv(&c.RateLimit, "RATE_LIMIT"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
