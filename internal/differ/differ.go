@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -90,10 +92,14 @@ func Run(ctx context.Context, oldCli, newCli *s3.Client, bucket string, opt Opti
 		_ = os.Remove(tmp + "-wal")
 		_ = os.Remove(tmp + "-shm")
 	}()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return res, err
+	}
 	if err := file.Close(); err != nil {
 		return res, err
 	}
-	db, err := sql.Open("sqlite", tmp+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", sqliteURI(tmp, "rwc", "journal_mode(WAL)", "busy_timeout(5000)"))
 	if err != nil {
 		return res, err
 	}
@@ -275,6 +281,72 @@ feed:
 		}
 	}
 	return res, printResult(opt.Writer, res)
+}
+
+// RunExtraBucket lists a bucket that exists only on the target and reports
+// its objects (or the empty bucket itself) as target-only extras.
+func RunExtraBucket(ctx context.Context, newCli *s3.Client, bucket string, opt Options) (Result, error) {
+	if opt.Writer == nil {
+		opt.Writer = io.Discard
+	}
+	res := Result{Bucket: bucket}
+	if _, err := newCli.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: awsv2.String(bucket)}); err != nil {
+		return res, fmt.Errorf("head target bucket %q: %w", bucket, err)
+	}
+	var mu sync.Mutex
+	tp := s3.NewListObjectsV2Paginator(newCli, &s3.ListObjectsV2Input{Bucket: awsv2.String(bucket), EncodingType: types.EncodingTypeUrl})
+	seenTokens := make(map[string]struct{})
+	for tp.HasMorePages() {
+		page, err := tp.NextPage(ctx)
+		if err != nil {
+			return res, fmt.Errorf("list target: %w", err)
+		}
+		if name := awsv2.ToString(page.Name); name != "" && name != bucket {
+			return res, fmt.Errorf("list target bucket mismatch: requested %q, returned %q", bucket, name)
+		}
+		if err := validatePageToken(page, seenTokens); err != nil {
+			return res, err
+		}
+		for _, obj := range page.Contents {
+			key, err := decodeKey(awsv2.ToString(obj.Key), page.EncodingType)
+			if err != nil {
+				return res, err
+			}
+			if key == "" {
+				return res, fmt.Errorf("target listing contains empty key")
+			}
+			if err := record(&mu, &res, opt.IssuesJSONL, Issue{Key: key, Kind: "extra", Detail: "only on target (bucket missing on source)"}); err != nil {
+				return res, err
+			}
+		}
+	}
+	if res.Extra == 0 {
+		if err := record(&mu, &res, opt.IssuesJSONL, Issue{Key: "", Kind: "extra", Detail: "bucket only on target"}); err != nil {
+			return res, err
+		}
+	}
+	return res, printResult(opt.Writer, res)
+}
+
+func sqliteURI(path, mode string, pragmas ...string) string {
+	abs, err := filepath.Abs(path)
+	if err == nil {
+		path = abs
+	}
+	u := url.URL{Scheme: "file", Path: sqliteURIPath(filepath.ToSlash(path), runtime.GOOS == "windows")}
+	q := url.Values{"mode": {mode}}
+	for _, pragma := range pragmas {
+		q.Add("_pragma", pragma)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func sqliteURIPath(path string, windows bool) string {
+	if windows && len(path) >= 2 && path[1] == ':' && !strings.HasPrefix(path, "/") {
+		return "/" + path
+	}
+	return path
 }
 
 func validatePageToken(page *s3.ListObjectsV2Output, seenTokens map[string]struct{}) error {

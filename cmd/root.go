@@ -37,6 +37,7 @@ func NewRoot() *cobra.Command {
 		Version:       Version,
 		Short:         rootShort,
 		Long:          rootLong + exampleFooter,
+		Args:          cobra.NoArgs,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -95,7 +96,16 @@ func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 	workersFlag, _ := flags.GetInt("workers")
 	multipartConcFlag, _ := flags.GetInt("multipart-concurrency")
 	rateLimitFlag, _ := flags.GetString("rate-limit")
-	cfg, err := config.Load(cfgPath)
+	workersSet := flags.Changed("workers")
+	multipartSet := flags.Changed("multipart-concurrency")
+	rateLimitSet := flags.Changed("rate-limit")
+	sourceFrozenSet := flags.Changed("source-frozen")
+	cfg, err := config.LoadForCLI(cfgPath, config.CLIReadOptions{
+		SkipWorkersEnv:              workersSet,
+		SkipMultipartConcurrencyEnv: multipartSet,
+		SkipRateLimitEnv:            rateLimitSet,
+		SkipSourceFrozenEnv:         sourceFrozenSet,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -109,15 +119,15 @@ func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 	if err := cfg.ApplyConcurrencyOverrides(
 		workersFlag,
 		multipartConcFlag,
-		cmd.Flags().Changed("workers"),
-		cmd.Flags().Changed("multipart-concurrency"),
+		workersSet,
+		multipartSet,
 	); err != nil {
 		return nil, err
 	}
-	if err := cfg.ApplyRateLimitOverride(rateLimitFlag, cmd.Flags().Changed("rate-limit")); err != nil {
+	if err := cfg.ApplyRateLimitOverride(rateLimitFlag, rateLimitSet); err != nil {
 		return nil, err
 	}
-	if cmd.Flags().Changed("source-frozen") {
+	if sourceFrozenSet {
 		cfg.SourceFrozen, _ = flags.GetBool("source-frozen")
 	}
 	return cfg, nil
@@ -128,6 +138,7 @@ func listCmd() *cobra.Command {
 		Use:   "list",
 		Short: listShort,
 		Long:  listLong,
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(cmd)
 			if err != nil {
@@ -170,6 +181,7 @@ func runCmd() *cobra.Command {
 		Use:   "run",
 		Short: runShort,
 		Long:  runLong,
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return forEachBucket(cmd, true, func(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error {
 				if err := scanOne(ctx, cfg, oldCli, bucket); err != nil {
@@ -188,6 +200,7 @@ func scanCmd() *cobra.Command {
 		Use:   "scan",
 		Short: scanShort,
 		Long:  scanLong,
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(cmd)
 			if err != nil {
@@ -225,6 +238,7 @@ func migrateCmd() *cobra.Command {
 		Use:   "migrate",
 		Short: migrateShort,
 		Long:  migrateLong,
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return forEachBucket(cmd, true, func(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error {
 				return migrateOne(ctx, cfg, oldCli, newCli, bucket, strict)
@@ -243,6 +257,7 @@ func diffCmd() *cobra.Command {
 		Use:   "diff",
 		Short: diffShort,
 		Long:  diffLong,
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var jsonl *os.File
 			if jsonlPath != "" {
@@ -252,26 +267,7 @@ func diffCmd() *cobra.Command {
 					return fmt.Errorf("create diff JSONL: %w", err)
 				}
 			}
-			runErr := forEachBucket(cmd, true, func(ctx context.Context, cfg *config.Config, oldCli, newCli *s3.Client, bucket string) error {
-				var issueWriter io.Writer
-				if jsonl != nil {
-					issueWriter = jsonl
-				}
-				res, err := differ.Run(ctx, oldCli, newCli, bucket, differ.Options{
-					Workers:     cfg.Workers,
-					ReportExtra: diffExtra || strict,
-					Writer:      os.Stdout,
-					IssuesJSONL: issueWriter,
-				})
-				if err != nil {
-					return err
-				}
-				if res.HasGaps() || (strict && res.Extra > 0) {
-					return fmt.Errorf("diff found gaps / 对比发现缺失或不一致: missing=%d size=%d content=%d metadata=%d extra=%d",
-						res.Missing, res.SizeMismatch, res.ContentMismatch, res.MetadataMismatch, res.Extra)
-				}
-				return nil
-			})
+			runErr := runDiffBuckets(cmd, diffExtra, strict, jsonl)
 			if jsonl != nil {
 				if err := jsonl.Close(); err != nil {
 					return errors.Join(runErr, fmt.Errorf("close diff JSONL: %w", err))
@@ -286,11 +282,110 @@ func diffCmd() *cobra.Command {
 	return c
 }
 
+func runDiffBuckets(cmd *cobra.Command, diffExtra, strict bool, jsonl *os.File) error {
+	cfg, err := loadConfig(cmd)
+	if err != nil {
+		return err
+	}
+	if err := cfg.ValidatePair(); err != nil {
+		return err
+	}
+	ctx, cancel := signalCtx(cmd.Context())
+	defer cancel()
+	pool := cfg.MaxInFlight()
+	oldCli, err := s3client.NewWithPool(ctx, cfg.Old, pool)
+	if err != nil {
+		return err
+	}
+	newCli, err := s3client.NewWithPool(ctx, cfg.New, pool)
+	if err != nil {
+		return err
+	}
+	names, err := resolveBuckets(ctx, cfg, oldCli)
+	if err != nil {
+		return err
+	}
+	reportExtra := diffExtra || strict
+	var extraBuckets []string
+	if cfg.AllBuckets() && reportExtra {
+		targetList, err := cluster.ListBuckets(ctx, newCli)
+		if err != nil {
+			return err
+		}
+		sourceSet := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			sourceSet[name] = struct{}{}
+		}
+		for _, b := range targetList {
+			if b.Name != "" {
+				if _, ok := sourceSet[b.Name]; !ok {
+					extraBuckets = append(extraBuckets, b.Name)
+				}
+			}
+		}
+	}
+	log.Printf("buckets=%d  %s → %s  workers=%d  rate_limit=%s", len(names)+len(extraBuckets), cfg.Old.Endpoint, cfg.New.Endpoint, cfg.Workers, cfg.RateLimit)
+	var issueWriter io.Writer
+	if jsonl != nil {
+		issueWriter = jsonl
+	}
+	var failed []string
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		res, err := differ.Run(ctx, oldCli, newCli, name, differ.Options{
+			Workers:     cfg.Workers,
+			ReportExtra: reportExtra,
+			Writer:      os.Stdout,
+			IssuesJSONL: issueWriter,
+		})
+		if err != nil {
+			log.Printf("bucket %s: %s", name, safeoutput.Escape(err.Error()))
+			failed = append(failed, name)
+			continue
+		}
+		if res.HasGaps() || (strict && res.Extra > 0) {
+			err := fmt.Errorf("diff found gaps / 对比发现缺失或不一致: missing=%d size=%d content=%d metadata=%d extra=%d",
+				res.Missing, res.SizeMismatch, res.ContentMismatch, res.MetadataMismatch, res.Extra)
+			log.Printf("bucket %s: %s", name, safeoutput.Escape(err.Error()))
+			failed = append(failed, name)
+		}
+	}
+	for _, name := range extraBuckets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		res, err := differ.RunExtraBucket(ctx, newCli, name, differ.Options{
+			Workers:     cfg.Workers,
+			ReportExtra: true,
+			Writer:      os.Stdout,
+			IssuesJSONL: issueWriter,
+		})
+		if err != nil {
+			log.Printf("bucket %s: %s", name, safeoutput.Escape(err.Error()))
+			failed = append(failed, name)
+			continue
+		}
+		if strict && res.Extra > 0 {
+			err := fmt.Errorf("diff found gaps / 对比发现缺失或不一致: missing=%d size=%d content=%d metadata=%d extra=%d",
+				res.Missing, res.SizeMismatch, res.ContentMismatch, res.MetadataMismatch, res.Extra)
+			log.Printf("bucket %s: %s", name, safeoutput.Escape(err.Error()))
+			failed = append(failed, name)
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("failed buckets / 失败的桶: %s", strings.Join(failed, ", "))
+	}
+	return nil
+}
+
 func statusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
 		Short: statusShort,
 		Long:  statusLong,
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(cmd)
 			if err != nil {
