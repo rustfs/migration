@@ -1,6 +1,6 @@
 package cmd
 
-const Version = "0.2.0"
+var Version = "0.2.0"
 
 const rootShort = `Safe one-way S3 migration / 安全的单向 S3 迁移`
 

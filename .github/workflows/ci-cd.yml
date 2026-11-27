@@ -1,0 +1,261 @@
+# Unified CI & CD pipeline:
+#   - CI: static checks, race-enabled unit/integration tests, Python tests, and MinIO -> RustFS E2E tests.
+#   - Package verification: builds and verifies Linux (amd64/arm64) binaries, .tar.gz archives, .deb and .rpm
+#     packages, plus Windows (amd64) .exe and .zip packages.
+#   - CD Release: on version tags (v* or X.Y*) or manual dispatch with release_tag, publishes all verified
+#     binaries, archives, DEB/RPM packages, and SHA256SUMS to GitHub Releases.
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+      - "[0-9]*.[0-9]*"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional existing Git tag to publish/update a GitHub Release (leave empty for CI/package run only)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ci-regression:
+    name: Regression & Race Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.release_tag || '' }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run static analysis
+        run: go vet -tags real_s3 ./...
+      - name: Run Go race test suite
+        run: go test -race -count=1 ./...
+      - name: Run Python script unit tests
+        run: python3 -m unittest discover -s scripts -v
+
+  ci-e2e:
+    name: E2E (MinIO to RustFS)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.release_tag || '' }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run CLI against MinIO and RustFS containers
+        run: |
+          python3 -m venv "$RUNNER_TEMP/e2e"
+          "$RUNNER_TEMP/e2e/bin/pip" install boto3==1.42.97
+          "$RUNNER_TEMP/e2e/bin/python" tests/e2e.py
+
+  package-linux:
+    name: Package (${{ matrix.target }} bin/tar.gz/deb/rpm)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-24.04
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            deb_arch: arm64
+            rpm_arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.release_tag || '' }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Exercise SQLite state store on ${{ matrix.target }}
+        run: go test -count=1 ./internal/store
+      - name: Install rpmbuild tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm
+      - name: Build binary, archive, DEB, and RPM packages
+        env:
+          MIGRATION_VERSION: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name || '') }}
+        run: python3 scripts/package.py "${{ matrix.target }}" dist --linux-packages
+      - name: Verify checksums, binary, archive, DEB install, and RPM metadata
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -lh
+          sha256sum -c *.sha256
+
+          # Verify standalone binary
+          ./migration-${{ matrix.target }} --version
+
+          # Verify .tar.gz binary package
+          mkdir -p verify-tar
+          tar -xzf "migration-${{ matrix.target }}.tar.gz" -C verify-tar
+          ./verify-tar/migration --version
+          rm -rf verify-tar
+
+          # Verify .deb package installation and removal
+          deb_file=(rustfs-migration_*_${{ matrix.deb_arch }}.deb)
+          test -f "${deb_file[0]}"
+          dpkg-deb --info "${deb_file[0]}"
+          sudo dpkg -i "${deb_file[0]}"
+          /usr/bin/migration --version
+          test -f /etc/rustfs-migration/config.example.yaml
+          sudo dpkg -r rustfs-migration
+
+          # Verify .rpm package metadata and file list
+          rpm_file=(rustfs-migration-*.${{ matrix.rpm_arch }}.rpm)
+          test -f "${rpm_file[0]}"
+          rpm -qip "${rpm_file[0]}"
+          rpm -qlp "${rpm_file[0]}" | grep -qx '/usr/bin/migration'
+          rpm -qlp "${rpm_file[0]}" | grep -qx '/etc/rustfs-migration/config.example.yaml'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages-${{ matrix.target }}
+          path: |
+            dist/migration-${{ matrix.target }}
+            dist/migration-${{ matrix.target }}.tar.gz
+            dist/rustfs-migration_*_${{ matrix.deb_arch }}.deb
+            dist/rustfs-migration-*.${{ matrix.rpm_arch }}.rpm
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  package-windows:
+    name: Package (windows-amd64 exe/zip)
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.release_tag || '' }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Exercise SQLite state store on windows-amd64
+        run: go test -count=1 ./internal/store
+      - name: Build Windows executable and zip package
+        env:
+          MIGRATION_VERSION: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name || '') }}
+        run: python scripts/package.py windows-amd64 dist
+      - name: Verify checksums, standalone exe, and zip package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -lh
+          sha256sum -c *.sha256
+          ./migration-windows-amd64.exe --version
+          mkdir -p verify-zip
+          unzip -q migration-windows-amd64.zip -d verify-zip
+          ./verify-zip/migration.exe --version
+          rm -rf verify-zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages-windows-amd64
+          path: |
+            dist/migration-windows-amd64.exe
+            dist/migration-windows-amd64.zip
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  cd-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    needs: [ci-regression, ci-e2e, package-linux, package-windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Verify complete asset set and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd release-assets
+
+          # Ensure every required deliverable is present before publishing
+          test -f migration-linux-amd64
+          test -f migration-linux-amd64.tar.gz
+          test -f migration-linux-arm64
+          test -f migration-linux-arm64.tar.gz
+          test -f migration-windows-amd64.exe
+          test -f migration-windows-amd64.zip
+
+          deb_amd64=(rustfs-migration_*_amd64.deb)
+          deb_arm64=(rustfs-migration_*_arm64.deb)
+          rpm_amd64=(rustfs-migration-*.x86_64.rpm)
+          rpm_arm64=(rustfs-migration-*.aarch64.rpm)
+          test -f "${deb_amd64[0]}"
+          test -f "${deb_arm64[0]}"
+          test -f "${rpm_amd64[0]}"
+          test -f "${rpm_arm64[0]}"
+
+          sha256sum -c *.sha256
+          sha256sum \
+            migration-linux-amd64 \
+            migration-linux-amd64.tar.gz \
+            "${deb_amd64[0]}" \
+            "${rpm_amd64[0]}" \
+            migration-linux-arm64 \
+            migration-linux-arm64.tar.gz \
+            "${deb_arm64[0]}" \
+            "${rpm_arm64[0]}" \
+            migration-windows-amd64.exe \
+            migration-windows-amd64.zip \
+            > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+          files=(
+            migration-linux-amd64
+            migration-linux-amd64.tar.gz
+            "${deb_amd64[0]}"
+            "${rpm_amd64[0]}"
+            migration-linux-arm64
+            migration-linux-arm64.tar.gz
+            "${deb_arm64[0]}"
+            "${rpm_arm64[0]}"
+            migration-windows-amd64.exe
+            migration-windows-amd64.zip
+            SHA256SUMS
+            *.sha256
+          )
+          ls -lh "${files[@]}"
+
+          if gh release view "$TARGET_TAG" >/dev/null 2>&1; then
+            gh release upload "$TARGET_TAG" "${files[@]}" --clobber
+          else
+            gh release create "$TARGET_TAG" "${files[@]}" \
+              --title "$TARGET_TAG" \
+              --generate-notes
+          fi

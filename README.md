@@ -41,7 +41,7 @@ Leave `bucket` empty to select every source bucket; set it or use `--bucket phot
 
 ## Install
 
-Choose the archive for your platform under **Artifacts** in a successful [Build packages run](https://github.com/rustfs/migration/actions/workflows/packages.yml). Verify the archive against its included SHA-256 digest before extracting it. Linux packages use `.tar.gz` (amd64 or arm64); Windows uses `.zip` (amd64) and the executable is `migration.exe`.
+Choose the archive or Linux system package (`.deb` / `.rpm`) for your platform under **Artifacts** in a successful [CI/CD run](https://github.com/rustfs/migration/actions/workflows/ci-cd.yml) or from [GitHub Releases](https://github.com/rustfs/migration/releases). Verify the download against its SHA-256 digest before extracting or installing it. Linux releases include standalone binaries (`migration-linux-amd64`, `migration-linux-arm64`), `.tar.gz` archives, Debian `.deb` packages (`amd64` / `arm64`) and RPM packages (`x86_64` / `aarch64`); Windows uses `.zip` / `.exe` (`amd64`).
 
 Protect configuration credentials and state files. The process logs endpoints and object keys; endpoint URLs cannot contain credentials, query strings or fragments. Use HTTPS across untrusted networks.
 

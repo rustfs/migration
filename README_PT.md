@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_ZH.md) | [Deutsch](README_DE.md) | [Español](README_ES.md) | [Français](README_FR.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | **Português** | [Русский](README_RU.md)
 
-**Importante: esta tradução está desatualizada.** Siga o [guia atual](docs/USAGE.md) e os [requisitos de segurança](README.md): congele externamente as escritas e eliminações na origem desde a leitura do inventário até à validação e coordene as eliminações no destino. `--source-frozen` não congela nada automaticamente. Verifique as escritas condicionais e não aceite apenas o código de saída 0 como prova de conclusão.
+**Importante: esta tradução está desatualizada.** Siga o [guia atual](docs/USAGE.md) e os [requisitos de segurança](README.md): congele externamente as escritas e eliminações na origem desde a leitura do inventário até à validação e coordene as eliminações no destino. `run` e `migrate` exigem `--source-frozen` (não congela nada automaticamente), e `diff` lê o corpo completo dos objetos em ambos os lados para verificar SHA-256 (sem `--rate-limit`). Verifique as escritas condicionais e não aceite apenas o código de saída 0 como prova de conclusão.
 
 O `migration` copia a versão atual dos objetos entre dois clusters compatíveis com S3. Por exemplo, pode transferir o histórico de um cluster RustFS ou MinIO enquanto a aplicação já escreve no novo cluster. Na configuração, `old` identifica a origem e `new` o destino. Ambos usam endereços S3 com o nome do bucket no caminho.
 

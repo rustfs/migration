@@ -53,6 +53,21 @@ class ReleaseValidationTests(unittest.TestCase):
             "RUSTFS_VOLUMES": "/external/data", "RUSTFS_CONSOLE_ENABLE": "true",
         }, clear=True):
             self.assertEqual(launcher.clean_rustfs_env(), {"PATH": "/bin", "RUSTFS_CONSOLE_ENABLE": "false"})
+            self.assertEqual(
+                launcher.clean_rustfs_env(tmpdir="/isolated/node-tmp"),
+                {"PATH": "/bin", "TMPDIR": "/isolated/node-tmp", "RUSTFS_CONSOLE_ENABLE": "false"},
+            )
+
+    def test_supports_server_subcommand_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            modern = Path(directory) / "rustfs-modern"
+            modern.write_text("#!/bin/sh\nprintf 'Commands:\\n  server  Start server\\n'\n")
+            modern.chmod(0o700)
+            legacy = Path(directory) / "rustfs-legacy"
+            legacy.write_text("#!/bin/sh\nprintf 'Usage: rustfs [OPTIONS] <VOLUMES>...\\n'\n")
+            legacy.chmod(0o700)
+            self.assertTrue(launcher.supports_server_subcommand(modern))
+            self.assertFalse(launcher.supports_server_subcommand(legacy))
 
     def test_unrecognized_version_output_is_rejected(self):
         for output in ("1.0.4", "unrelated 1.0.4", "rustfs development"):

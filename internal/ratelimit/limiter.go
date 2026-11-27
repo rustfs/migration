@@ -30,14 +30,6 @@ func New(bytesPerSecond int64) *Limiter {
 	return &Limiter{bps: bytesPerSecond}
 }
 
-// Limit reports the configured bytes per second. Nil is unlimited (0).
-func (l *Limiter) Limit() int64 {
-	if l == nil {
-		return 0
-	}
-	return l.bps
-}
-
 // WaitN blocks until n bytes fit on the shared timeline, or until ctx ends.
 // The wait is "until the previous bytes have been paid"; this call's own
 // cost is what delays the next caller. Cancelling gives the unused tail

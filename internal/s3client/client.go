@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"time"
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/rustfs/migration/internal/config"
@@ -30,14 +30,11 @@ func New(ctx context.Context, ep config.Endpoint) (*s3.Client, error) {
 // reconnecting on every object when MaxIdleConnsPerHost would otherwise
 // stay at the Go default of 2.
 func NewWithPool(ctx context.Context, ep config.Endpoint, idlePerHost int) (*s3.Client, error) {
-	// Self-hosted clusters have no EC2 IMDS; disable it so LoadDefaultConfig
-	// does not hang for several seconds on a missing metadata service.
-	if os.Getenv("AWS_EC2_METADATA_DISABLED") == "" {
-		_ = os.Setenv("AWS_EC2_METADATA_DISABLED", "true")
-	}
-
+	// Self-hosted clusters have no EC2 IMDS; disable it on the config loader
+	// without mutating process-wide environment variables across goroutines.
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(ep.Region),
+		awsconfig.WithEC2IMDSClientEnableState(imds.ClientDisabled),
 		awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(ep.AccessKey, ep.SecretKey, ep.SessionToken),
 		),
