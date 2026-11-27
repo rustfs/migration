@@ -16,19 +16,19 @@
 
 ## 快速开始
 
-以下命令在仓库根目录运行，需要 Go 1.22 或更高版本。复制配置模板后，请先编辑 `config.yaml`，填入两端的地址和凭据。
+以下命令在仓库根目录运行，需要 Go 1.26 或更高版本（`go.mod` 自动选用 `go1.26.10`）。复制配置模板后，请先编辑 `config.yaml`，填入两端的地址、凭据与独立的状态目录，并在外部冻结源端写入和删除、协调目标端删除。
 
 ```bash
 git clone https://github.com/rustfs/migration.git
 cd migration
 CGO_ENABLED=0 go build -o bin/migration .
 # 或：make build
-cp config.example.yaml config.yaml   # 填写来源和目标的地址、密钥
+cp config.example.yaml config.yaml   # 填写来源和目标的地址、密钥与独立状态目录
 ```
 
 ```bash
 ./bin/migration list   -c config.yaml
-./bin/migration run    -c config.yaml --workers 16 --rate-limit 20M
+./bin/migration run    -c config.yaml --source-frozen --workers 16 --rate-limit 20M
 ./bin/migration status -c config.yaml
 ./bin/migration diff   -c config.yaml
 ```
@@ -41,7 +41,7 @@ cp config.example.yaml config.yaml   # 填写来源和目标的地址、密钥
 
 ## 使用预编译包
 
-打开 [Build packages](https://github.com/rustfs/migration/actions/workflows/packages.yml)，在成功运行的 **Artifacts** 中选择对应平台。解压下载文件，用随附的 SHA-256 校验值核对软件包，再解开软件包。Linux amd64 和 arm64 使用 `.tar.gz`，Windows amd64 使用 `.zip`，可执行文件为 `migration.exe`。
+打开 [CI/CD 工作流](https://github.com/rustfs/migration/actions/workflows/ci-cd.yml) 的 **Artifacts** 或 [GitHub Releases](https://github.com/rustfs/migration/releases)，选择对应平台的构建产物，并用随附的 SHA-256 校验值核对后再解压或安装。Linux 平台提供独立二进制（`migration-linux-amd64`、`migration-linux-arm64`）、`.tar.gz` 压缩包、Debian `.deb` 包（`amd64` / `arm64`）以及 `.rpm` 包（`x86_64` / `aarch64`）；Windows amd64 提供独立可执行文件与 `.zip` 包（可执行文件为 `migration.exe`）。
 
 ```bash
 ./migration --version
@@ -153,11 +153,11 @@ rate_limit: 0                     # 源读取合计上限；0 或省略 = 不限
 | 命令 | 作用 | 是否写目标 | 并发与限额 |
 | --- | --- | --- | --- |
 | `migration list -c config.yaml` | 列出源上全部桶 | 否 | 无 |
-| `migration run -c config.yaml` | **推荐。** 先扫描再复制 | 是，但不覆盖 | 扫描单线程。复制使用 `workers`、`multipart_concurrency` 和 `rate_limit` |
+| `migration run -c config.yaml --source-frozen` | **推荐。** 先扫描再复制 | 是，但不覆盖 | 扫描单线程。复制使用 `workers`、`multipart_concurrency` 和 `rate_limit` |
 | `migration scan -c config.yaml` | 把源清单写入 SQLite | 否 | 单线程。不限速 |
-| `migration migrate -c config.yaml` | 只复制 SQLite 里 `pending` 或 `failed` 的行 | 是，但不覆盖 | `workers`、`multipart_concurrency` 和 `rate_limit` |
+| `migration migrate -c config.yaml --source-frozen` | 只复制已完成扫描清单中 `pending` 或 `failed` 的行 | 是，但不覆盖 | `workers`、`multipart_concurrency` 和 `rate_limit` |
 | `migration status -c config.yaml` | 打印本地计数 | 否 | 无。不访问 S3 |
-| `migration diff -c config.yaml` | 列举源端对象，逐个在目标端执行 `HEAD` | 否 | `workers` 控制并行 HEAD。不限速 |
+| `migration diff -c config.yaml` | 列举源端对象，读取双端完整正文核对 SHA-256 与保留元数据 | 否 | `workers` 控制并行校验。读取全部数据，不受 `rate_limit` 限制 |
 | `migration diff --extra -c config.yaml` | 同上，并列出只在目标上的 key | 否 | `workers` |
 
 所有命令共用的参数：
@@ -182,7 +182,7 @@ rate_limit: 0                     # 源读取合计上限；0 或省略 = 不限
 
 ```bash
 ./bin/migration list   -c config.yaml
-./bin/migration run    -c config.yaml --workers 16 --rate-limit 20M
+./bin/migration run    -c config.yaml --source-frozen --workers 16 --rate-limit 20M
 ./bin/migration status -c config.yaml
 ./bin/migration diff   -c config.yaml --workers 32
 ```
@@ -194,24 +194,24 @@ rate_limit: 0                     # 源读取合计上限；0 或省略 = 不限
 3. 目标上没有该桶就创建。已有的桶不动。
 4. 最多同时复制 `workers` 个对象。如果业务恰好在目标检查后创建同名对象，条件写入会保护该对象。工具会重新核对目标，将结果记为 `done` 或 `conflict`。
 5. 对象大小达到 `multipart_threshold` 时采用分片上传。每个对象最多并行传输 `multipart_concurrency` 个分片，所有源端读取共享同一带宽上限。
-6. 核对目标上的大小。普通上传的对象在 ETag 可比时再比 ETag。见 [对象状态](#resume-and-object-state)。
+6. 从目标完整读回对象核对大小、保留的元数据与全文 SHA-256。见 [对象状态](#resume-and-object-state)。
 
 桶按顺序迁移，所以 `rate_limit` 就是整个进程的上限。
 
 ### 只迁一个桶
 
 ```bash
-./bin/migration run -c config.yaml \
+./bin/migration run -c config.yaml --source-frozen \
   --bucket photos --workers 8 --multipart-concurrency 8 --rate-limit 30M
 ```
 
 ### 源上后来写入的对象
 
-`ListObjectsV2` 不能在服务端按修改时间过滤。要补齐新增对象，需要重新列举整个源桶。新发现的对象会标记为 `pending`。再次被列出的 `failed` 或 `skipped` 行回到 `pending`。`done` 和 `conflict` 保持不变，所以第二遍不会重传，也不会覆盖目标。
+`ListObjectsV2` 不能在服务端按修改时间过滤。本工具设计用于冻结源端后的单次迁移，而非持续同步；若在重新冻结后补齐新增对象，需要重新列举整个源桶。新发现或源身份变化的对象会标记为 `pending`；再次被列出的 `failed` 或 `skipped` 行回到 `pending`；源端已删除的历史行会在完整重扫结束时移出清单。目标已有不同内容时记录 `conflict`，不会覆盖目标。
 
 ```bash
 ./bin/migration scan    -c config.yaml
-./bin/migration migrate -c config.yaml --workers 16
+./bin/migration migrate -c config.yaml --source-frozen --workers 16
 ./bin/migration diff    -c config.yaml
 ```
 
@@ -220,9 +220,9 @@ rate_limit: 0                     # 源读取合计上限；0 或省略 = 不限
 ### 先建立清单，再复制
 
 ```bash
-./bin/migration scan   -c config.yaml
-./bin/migration status -c config.yaml    # 对象计数，不访问 S3
-./bin/migration migrate -c config.yaml --workers 16
+./bin/migration scan    -c config.yaml
+./bin/migration status  -c config.yaml    # 对象计数，不访问 S3
+./bin/migration migrate -c config.yaml --source-frozen --workers 16
 ```
 
 ## 并发
@@ -293,9 +293,9 @@ rate_limit: 20M
 ```
 
 ```bash
-RATE_LIMIT=30M ./bin/migration run -c config.yaml
-./bin/migration migrate -c config.yaml --rate-limit 50M
-./bin/migration run -c config.yaml --rate-limit 0    # 明确不限速
+RATE_LIMIT=30M ./bin/migration run -c config.yaml --source-frozen
+./bin/migration migrate -c config.yaml --source-frozen --rate-limit 50M
+./bin/migration run -c config.yaml --source-frozen --rate-limit 0    # 明确不限速
 ```
 
 <a id="resume-and-object-state"></a>
@@ -322,7 +322,7 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 | `done` | 已复制并校验，或目标上已有与清单一致的对象 | 不动 |
 | `conflict` | 目标已有该 key，且与清单不一致。未覆盖 | 不动 |
 
-目标端已有同名对象时，只有大小相同，且两端 ETag 均非空、完全相同，才会记为 `done`。其余情况均记为 `conflict`，保留目标对象。分片边界不同，即便内容相同也可能产生不同的 ETag。若在上传成功后、状态落盘前中断，恢复时请人工核实这类冲突。
+目标端已有同名对象时，只有大小相同、保留的元数据一致，且读取双端完整正文计算出的 SHA-256 完全相同，才会记为 `done`（不依赖跨端 ETag 比较）。其余情况均记为 `conflict`，保留目标对象。
 
 每条冲突在冲突日志里占一行 TSV，时间是 RFC3339 UTC：
 
@@ -330,30 +330,31 @@ RATE_LIMIT=30M ./bin/migration run -c config.yaml
 <object-key>	<source-LastModified>	<target-LastModified>
 ```
 
-键名若包含控制字符或以双引号开头，日志会按 Go 字符串字面量的规则加引号并转义。
+键名若包含控制字符、反斜杠或以双引号开头，日志会按 Go 字符串字面量的规则加引号并转义。
 
-只配置了一个桶时，使用写下的 `db_path` 和 `conflict_log`。全桶模式在旁边生成：
+只配置了一个桶时，使用写下的 `db_path` 和 `conflict_log`。全桶模式保留配置的基础文件名并在旁边生成：
 
-- `migration-<桶名>.db`
-- `conflict-<桶名>.log`
+- `<基础文件名>-<桶名>.db`（默认 `migration-<桶名>.db`）
+- `<基础文件名>-<桶名>.log`（默认 `conflict-<桶名>.log`）
 
-执行 `migrate` 前须先用 `scan` 或 `run` 建立清单。状态库会绑定桶名和两端地址。使用旧版本的状态库前，请先核实它对应的集群。升级后的首次扫描会记录源地址，首次迁移会记录目标地址。扫描失败或中断后，请先重新执行 `scan` 或 `run`，再使用 `migrate`。旧版本的状态库没有扫描完成标记。如果无法确认清单完整，请重新扫描。
+执行 `migrate` 前须先用 `scan` 或 `run` 建立完整清单。状态库会绑定桶名和两端规范化地址。扫描失败或中断后，请先重新执行 `scan` 或 `run`，再使用 `migrate`。旧版无身份绑定且已有处理记录的状态库会被拒绝接管，请使用新的独立状态目录重新扫描。
 
 ## 用 diff 核对目标
 
-`diff` 通过大小和可比较的 ETag 核对对象，不下载正文。`ok` 中仅校验了大小的对象另计入 `size_only`。添加 `--extra` 会建立临时索引，列出仅存在于目标端的对象。源桶为空时，`diff` 仍会检查目标桶是否存在。目标桶缺失会返回退出码 1。
+`diff` 检查两端桶是否存在，并对每个同大小对象**完整读取源端与目标端正文**校验 SHA-256 及保留的元数据（需要双端 `GetObject` 权限与读带宽，且不受 `--rate-limit` 限制）。添加 `--extra` 会建立临时索引（优先使用 `spool_dir`），列出仅存在于目标端的对象；`--strict` 还会对目标独有对象返回非零退出码；`--issues-jsonl <新文件路径>` 可流式导出全部差异记录。
 
 ```bash
 ./bin/migration diff -c config.yaml --workers 32
 ./bin/migration diff -c config.yaml --extra
+./bin/migration diff -c config.yaml --strict --issues-jsonl ./issues.jsonl
 ```
 
 ```text
 === diff photos ===
-ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0  size_only=3
-一致=1000  缺失=2  大小不一致=0  ETag不一致=1  仅目标有=0  仅比大小=3
-  missing  a.txt  not on target
-  etag     b.txt  src=abc dst=def
+ok=1000  missing=2  size_mismatch=0  etag_mismatch=0  content_mismatch=1  metadata_mismatch=0  extra_on_target=0
+一致=1000  缺失=2  大小不一致=0  内容SHA256不一致=1  元数据不一致=0  仅目标有=0
+  missing  "a.txt"  not on target
+  content  "b.txt"  sha256 src=... dst=...
 ```
 
 第二行汇总是中文，因为命令本身就会打印这一行。最多打印 50 条问题，其余记在末尾的 “and N more” 里。
@@ -376,7 +377,7 @@ ok=1000  missing=2  size_mismatch=0  etag_mismatch=1  extra_on_target=0  size_on
 | 迁移中源被删除 | 完整返回的源 404 记 `skipped`。取消和超时记 `failed`，下次会重试 |
 | 中断后恢复 | 每个对象的状态在 SQLite WAL 里。第一次信号取消 worker；下次 `migrate` 继续 |
 | 内存有上限 | 小对象落盘。大对象按分片读。任务队列有上限 |
-| 复制后校验 | 总是比大小。普通上传的对象在两边 ETag 可比时再比 ETag |
+| 复制后校验 | 总是核对大小、保留的元数据，并完整读回核对正文 SHA-256 |
 
 不做：版本历史、删除标记、Object Lock、桶策略、生命周期规则、双向同步，以及服务端 `CopyObject`（两个集群是分开的，字节经过本进程）。
 

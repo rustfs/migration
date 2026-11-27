@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_ZH.md) | [Deutsch](README_DE.md) | [Español](README_ES.md) | [Français](README_FR.md) | [日本語](README_JA.md) | **한국어** | [Português](README_PT.md) | [Русский](README_RU.md)
 
-**중요: 이 번역은 오래되었습니다.** 운영 시 [최신 안내](docs/USAGE.md)와 [안전 요구사항](README.md)을 따르세요. 스캔부터 최종 검증까지 원본 쓰기와 삭제를 외부에서 동결하고 대상 삭제도 조율해야 합니다. `--source-frozen`은 자동으로 동결하지 않습니다. 조건부 쓰기를 확인하고 종료 코드 0만으로 완료를 판단하지 마세요.
+**중요: 이 번역은 오래되었습니다.** 운영 시 [최신 안내](docs/USAGE.md)와 [안전 요구사항](README.md)을 따르세요. 스캔부터 최종 검증까지 원본 쓰기와 삭제를 외부에서 동결하고 대상 삭제도 조율해야 합니다. `run`과 `migrate`에는 `--source-frozen`이 필수이며(자동 동결 아님), `diff`는 SHA-256 검증을 위해 양쪽 객체 본문 전체를 읽습니다(`--rate-limit` 미적용). 조건부 쓰기를 확인하고 종료 코드 0만으로 완료를 판단하지 마세요.
 
 `migration`은 S3 호환 클러스터 간에 객체의 현재 버전을 복사하는 도구입니다. 애플리케이션의 쓰기 요청을 새 클러스터로 전환한 뒤에도 기존 RustFS 또는 MinIO 클러스터에 남은 데이터를 옮길 수 있습니다. 설정에서 `old`는 원본, `new`는 대상을 가리킵니다. 두 클러스터 모두 URL 경로에 버킷 이름을 넣는 방식을 사용합니다.
 

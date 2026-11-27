@@ -19,9 +19,13 @@ import (
 )
 
 type Metadata struct {
-	ContentEncoding string
-	ContentType     string
-	Metadata        map[string]string
+	CacheControl       string
+	ContentDisposition string
+	ContentEncoding    string
+	ContentLanguage    string
+	ContentType        string
+	Expires            string
+	Metadata           map[string]string
 }
 
 type object struct {
@@ -677,11 +681,23 @@ func md5hex(value []byte) string {
 }
 
 func writeMetadataHeaders(w http.ResponseWriter, meta Metadata) {
+	if meta.CacheControl != "" {
+		w.Header().Set("Cache-Control", meta.CacheControl)
+	}
+	if meta.ContentDisposition != "" {
+		w.Header().Set("Content-Disposition", meta.ContentDisposition)
+	}
 	if meta.ContentEncoding != "" {
 		w.Header().Set("Content-Encoding", meta.ContentEncoding)
 	}
+	if meta.ContentLanguage != "" {
+		w.Header().Set("Content-Language", meta.ContentLanguage)
+	}
 	if meta.ContentType != "" {
 		w.Header().Set("Content-Type", meta.ContentType)
+	}
+	if meta.Expires != "" {
+		w.Header().Set("Expires", meta.Expires)
 	}
 	for key, value := range meta.Metadata {
 		w.Header().Set("X-Amz-Meta-"+key, value)
@@ -690,9 +706,13 @@ func writeMetadataHeaders(w http.ResponseWriter, meta Metadata) {
 
 func readMetadataHeaders(r *http.Request) Metadata {
 	meta := Metadata{
-		ContentType:     r.Header.Get("Content-Type"),
-		ContentEncoding: r.Header.Get("Content-Encoding"),
-		Metadata:        map[string]string{},
+		CacheControl:       r.Header.Get("Cache-Control"),
+		ContentDisposition: r.Header.Get("Content-Disposition"),
+		ContentEncoding:    r.Header.Get("Content-Encoding"),
+		ContentLanguage:    r.Header.Get("Content-Language"),
+		ContentType:        r.Header.Get("Content-Type"),
+		Expires:            r.Header.Get("Expires"),
+		Metadata:           map[string]string{},
 	}
 	if meta.ContentType == "" {
 		meta.ContentType = "application/octet-stream"

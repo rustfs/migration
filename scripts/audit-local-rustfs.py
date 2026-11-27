@@ -20,11 +20,21 @@ TOTAL_TIMEOUT_SECONDS = 420
 GO_TIMEOUT_SECONDS = 360  # Includes compilation; the test binary gets five minutes.
 
 
-def clean_rustfs_env():
+def clean_rustfs_env(tmpdir=None):
     """Do not inherit unrelated RustFS or cloud credentials/settings."""
     env = {key: os.environ[key] for key in ("PATH", "HOME", "TMPDIR") if key in os.environ}
+    if tmpdir is not None:
+        env["TMPDIR"] = str(tmpdir)
     env["RUSTFS_CONSOLE_ENABLE"] = "false"
     return env
+
+
+def supports_server_subcommand(binary_path):
+    """Detect whether this RustFS release uses `rustfs server ...` or `rustfs <volumes>`."""
+    result = subprocess.run([str(binary_path), "--help"], env=clean_rustfs_env(),
+                            capture_output=True, text=True, timeout=15, check=False)
+    output = result.stdout + result.stderr
+    return bool(re.search(r"(?m)^\s+server\b", output))
 
 
 def parse_version(output):
@@ -111,21 +121,28 @@ def main(argv=None):
     processes, logs, endpoints = [], [], []
     deadline = time.monotonic() + TOTAL_TIMEOUT_SECONDS
     go_proc = None
+    use_server_subcmd = supports_server_subcommand(metadata["binary_path"])
     try:
         with tempfile.TemporaryDirectory(prefix="migration-audit-rustfs-") as base:
             try:
                 for name in ("source", "target"):
                     data = Path(base) / name
                     data.mkdir()
+                    node_tmp = Path(base) / f"{name}-tmp"
+                    node_tmp.mkdir()
                     port = free_port()
                     endpoint = f"http://127.0.0.1:{port}"
                     log = (output / f"rustfs-{name}.log").open("w")
                     logs.append(log)
-                    proc = subprocess.Popen([
-                        metadata["binary_path"], "server", "--address", f"127.0.0.1:{port}",
+                    cmd = [metadata["binary_path"]]
+                    if use_server_subcmd:
+                        cmd.append("server")
+                    cmd.extend([
+                        "--address", f"127.0.0.1:{port}",
                         "--access-key", "audit-local", "--secret-key", "audit-local-secret", str(data),
-                    ], cwd=base, env=clean_rustfs_env(), stdout=log,
-                        stderr=subprocess.STDOUT, start_new_session=True)
+                    ])
+                    proc = subprocess.Popen(cmd, cwd=base, env=clean_rustfs_env(tmpdir=node_tmp), stdout=log,
+                                            stderr=subprocess.STDOUT, start_new_session=True)
                     processes.append(proc)
                     start_deadline = min(deadline, time.monotonic() + 45)
                     while True:

@@ -259,21 +259,7 @@ func diffCmd() *cobra.Command {
 		Long:  diffLong,
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var jsonl *os.File
-			if jsonlPath != "" {
-				var err error
-				jsonl, err = os.OpenFile(jsonlPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-				if err != nil {
-					return fmt.Errorf("create diff JSONL: %w", err)
-				}
-			}
-			runErr := runDiffBuckets(cmd, diffExtra, strict, jsonl)
-			if jsonl != nil {
-				if err := jsonl.Close(); err != nil {
-					return errors.Join(runErr, fmt.Errorf("close diff JSONL: %w", err))
-				}
-			}
-			return runErr
+			return runDiffBuckets(cmd, diffExtra, strict, jsonlPath)
 		},
 	}
 	c.Flags().StringVar(&jsonlPath, "issues-jsonl", "", "write all differences to a new JSONL file / 将全部差异写入新的 JSONL 文件")
@@ -282,13 +268,28 @@ func diffCmd() *cobra.Command {
 	return c
 }
 
-func runDiffBuckets(cmd *cobra.Command, diffExtra, strict bool, jsonl *os.File) error {
+func runDiffBuckets(cmd *cobra.Command, diffExtra, strict bool, jsonlPath string) error {
 	cfg, err := loadConfig(cmd)
 	if err != nil {
 		return err
 	}
 	if err := cfg.ValidatePair(); err != nil {
 		return err
+	}
+	var jsonl *os.File
+	if jsonlPath != "" {
+		if dir := filepath.Dir(jsonlPath); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return fmt.Errorf("create diff JSONL dir %s: %w", dir, err)
+			}
+		}
+		jsonl, err = os.OpenFile(jsonlPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return fmt.Errorf("create diff JSONL: %w", err)
+		}
+		defer func() {
+			_ = jsonl.Close()
+		}()
 	}
 	ctx, cancel := signalCtx(cmd.Context())
 	defer cancel()
@@ -337,6 +338,7 @@ func runDiffBuckets(cmd *cobra.Command, diffExtra, strict bool, jsonl *os.File) 
 		res, err := differ.Run(ctx, oldCli, newCli, name, differ.Options{
 			Workers:     cfg.Workers,
 			ReportExtra: reportExtra,
+			TempDir:     cfg.SpoolDir,
 			Writer:      os.Stdout,
 			IssuesJSONL: issueWriter,
 		})
@@ -359,6 +361,7 @@ func runDiffBuckets(cmd *cobra.Command, diffExtra, strict bool, jsonl *os.File) 
 		res, err := differ.RunExtraBucket(ctx, newCli, name, differ.Options{
 			Workers:     cfg.Workers,
 			ReportExtra: true,
+			TempDir:     cfg.SpoolDir,
 			Writer:      os.Stdout,
 			IssuesJSONL: issueWriter,
 		})
@@ -374,10 +377,19 @@ func runDiffBuckets(cmd *cobra.Command, diffExtra, strict bool, jsonl *os.File) 
 			failed = append(failed, name)
 		}
 	}
+	var runErr error
 	if len(failed) > 0 {
-		return fmt.Errorf("failed buckets / 失败的桶: %s", strings.Join(failed, ", "))
+		runErr = fmt.Errorf("failed buckets / 失败的桶: %s", strings.Join(failed, ", "))
 	}
-	return nil
+	if jsonl != nil {
+		if err := jsonl.Sync(); err != nil {
+			return errors.Join(runErr, fmt.Errorf("sync diff JSONL: %w", err))
+		}
+		if err := jsonl.Close(); err != nil {
+			return errors.Join(runErr, fmt.Errorf("close diff JSONL: %w", err))
+		}
+	}
+	return runErr
 }
 
 func statusCmd() *cobra.Command {
@@ -571,35 +583,77 @@ func statusTargets(cfg *config.Config) ([]dbTarget, error) {
 	if !cfg.AllBuckets() {
 		return []dbTarget{{bucket: cfg.Bucket, path: cfg.DBPath}}, nil
 	}
-	matches, err := filepath.Glob(cfg.DBPathFor("*"))
-	if err != nil {
+	rawDir := filepath.Dir(cfg.DBPath)
+	readDir := rawDir
+	if readDir == "" {
+		readDir = "."
+	}
+	ext := filepath.Ext(cfg.DBPath)
+	stem := strings.TrimSuffix(filepath.Base(cfg.DBPath), ext)
+	if ext == "" {
+		ext = ".db"
+	}
+	prefix := stem + "-"
+
+	entries, err := os.ReadDir(readDir)
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	if _, err := os.Stat(cfg.DBPath); err == nil {
-		matches = append(matches, cfg.DBPath)
-	} else if !os.IsNotExist(err) {
-		return nil, err
-	}
-	var out []dbTarget
-	seen := make(map[string]bool)
-	for _, path := range matches {
-		if seen[path] {
+	var matches []string
+	for _, entry := range entries {
+		if entry.IsDir() {
 			continue
 		}
-		seen[path] = true
+		name := entry.Name()
+		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, ext) && len(name) > len(prefix)+len(ext) {
+			if rawDir == "" || rawDir == "." {
+				matches = append(matches, name)
+			} else {
+				matches = append(matches, filepath.Join(rawDir, name))
+			}
+		}
+	}
+
+	var out []dbTarget
+	seenPaths := make(map[string]bool)
+	seenBuckets := make(map[string]bool)
+	inspect := func(path string, skipDuplicateBucket bool) error {
+		clean := filepath.Clean(path)
+		if seenPaths[clean] {
+			return nil
+		}
+		seenPaths[clean] = true
 		st, err := store.OpenExisting(path)
 		if err != nil {
-			return nil, fmt.Errorf("read state %s: %w", path, err)
+			return fmt.Errorf("read state %s: %w", path, err)
 		}
 		name, readErr := st.BoundBucket()
 		closeErr := st.Close()
 		if err := errors.Join(readErr, closeErr); err != nil {
-			return nil, err
+			return err
 		}
 		if name == "" {
-			return nil, fmt.Errorf("state %s has no bound bucket", path)
+			return fmt.Errorf("state %s has no bound bucket", path)
 		}
+		if skipDuplicateBucket && seenBuckets[name] {
+			return nil
+		}
+		seenBuckets[name] = true
 		out = append(out, dbTarget{bucket: name, path: path})
+		return nil
+	}
+
+	for _, path := range matches {
+		if err := inspect(path, false); err != nil {
+			return nil, err
+		}
+	}
+	if info, err := os.Stat(cfg.DBPath); err == nil && !info.IsDir() {
+		if err := inspect(cfg.DBPath, true); err != nil {
+			return nil, err
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, err
 	}
 	return out, nil
 }

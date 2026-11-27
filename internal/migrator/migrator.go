@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -22,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/rustfs/migration/internal/config"
 	"github.com/rustfs/migration/internal/ratelimit"
@@ -61,7 +61,35 @@ type objectAttrs struct {
 	ContentLanguage    *string
 	ContentType        *string
 	Expires            *time.Time
+	ExpiresString      *string
 	Metadata           map[string]string
+}
+
+func (a objectAttrs) effectiveContentType() *string {
+	return awsv2.String(s3client.EffectiveContentType(a.ContentType))
+}
+
+func (a objectAttrs) expiresAPIOptions() []func(*s3.Options) {
+	if a.Expires != nil || strings.TrimSpace(awsv2.ToString(a.ExpiresString)) == "" {
+		return nil
+	}
+	raw := strings.TrimSpace(*a.ExpiresString)
+	return []func(*s3.Options){func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, smithyhttp.SetHeaderValue("Expires", raw))
+	}}
+}
+
+func (a objectAttrs) toHeadOutput() *s3.HeadObjectOutput {
+	return &s3.HeadObjectOutput{
+		CacheControl:       a.CacheControl,
+		ContentDisposition: a.ContentDisposition,
+		ContentEncoding:    a.ContentEncoding,
+		ContentLanguage:    a.ContentLanguage,
+		ContentType:        a.ContentType,
+		Expires:            a.Expires,
+		ExpiresString:      a.ExpiresString,
+		Metadata:           a.Metadata,
+	}
 }
 
 func New(cfg *config.Config, oldCli, newCli *s3.Client, st *store.Store) (*Migrator, error) {
@@ -237,6 +265,13 @@ type persistenceError struct{ err error }
 func (e *persistenceError) Error() string { return e.err.Error() }
 func (e *persistenceError) Unwrap() error { return e.err }
 
+// completeMultipartError marks errors returned specifically by CompleteMultipartUpload,
+// distinguishing a consumed upload ID on commit retry from an earlier part failure.
+type completeMultipartError struct{ err error }
+
+func (e *completeMultipartError) Error() string { return e.err.Error() }
+func (e *completeMultipartError) Unwrap() error { return e.err }
+
 type sourceSnapshot struct {
 	attrs     objectAttrs
 	etag      string
@@ -292,9 +327,13 @@ func (m *Migrator) migrateObject(ctx context.Context, obj store.Object) error {
 	}
 	if err != nil {
 		var api smithy.APIError
-		if errors.As(err, &api) && api.ErrorCode() == "PreconditionFailed" {
-			// A concurrent writer won the atomic create. Only classify a
-			// destination conditional write, never a source If-Match failure.
+		var completeErr *completeMultipartError
+		isPreconditionFailed := errors.As(err, &api) && api.ErrorCode() == "PreconditionFailed"
+		isLostComplete := errors.As(err, &completeErr) && errors.As(err, &api) && api.ErrorCode() == "NoSuchUpload"
+		if isPreconditionFailed || isLostComplete {
+			// A concurrent writer won the atomic create, or a successful commit
+			// lost its response and its SDK retry received 412 / NoSuchUpload.
+			// Never classify a source If-Match failure here.
 			var source *sourceReadError
 			if !errors.As(err, &source) {
 				target, herr := m.NewCli.HeadObject(ctx, &s3.HeadObjectInput{Bucket: awsv2.String(m.Bucket), Key: awsv2.String(obj.Key)})
@@ -302,8 +341,6 @@ func (m *Migrator) migrateObject(ctx context.Context, obj store.Object) error {
 					if checkErr := m.checkSourceBeforeCommit(ctx, obj, snapshot); checkErr != nil {
 						return checkErr
 					}
-					// A successful commit may have lost its response. The SDK
-					// retries If-None-Match and receives 412 for our own bytes.
 					return m.reconcileExistingTarget(ctx, obj, snapshot, target)
 				}
 			}
@@ -395,7 +432,8 @@ func (m *Migrator) sourceSnapshot(ctx context.Context, obj store.Object) (source
 	}
 	return sourceSnapshot{etag: etag, versionID: out.VersionId, size: obj.Size, attrs: objectAttrs{
 		CacheControl: out.CacheControl, ContentDisposition: out.ContentDisposition, ContentEncoding: out.ContentEncoding,
-		ContentLanguage: out.ContentLanguage, ContentType: out.ContentType, Expires: out.Expires, Metadata: copyMetadata(out.Metadata),
+		ContentLanguage: out.ContentLanguage, ContentType: out.ContentType, Expires: out.Expires, ExpiresString: out.ExpiresString,
+		Metadata: copyMetadata(out.Metadata),
 	}}, nil
 }
 
@@ -470,8 +508,8 @@ func (m *Migrator) copySingle(ctx context.Context, obj store.Object, snap source
 	_, err = m.NewCli.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: awsv2.String(m.Bucket), Key: awsv2.String(obj.Key), Body: tmp, ContentLength: awsv2.Int64(obj.Size), IfNoneMatch: awsv2.String("*"),
 		CacheControl: attrs.CacheControl, ContentDisposition: attrs.ContentDisposition, ContentEncoding: attrs.ContentEncoding,
-		ContentLanguage: attrs.ContentLanguage, ContentType: attrs.ContentType, Expires: attrs.Expires, Metadata: attrs.Metadata,
-	})
+		ContentLanguage: attrs.ContentLanguage, ContentType: attrs.effectiveContentType(), Expires: attrs.Expires, Metadata: attrs.Metadata,
+	}, attrs.expiresAPIOptions()...)
 	if err != nil {
 		return fmt.Errorf("put target: %w", err)
 	}
@@ -479,25 +517,7 @@ func (m *Migrator) copySingle(ctx context.Context, obj store.Object, snap source
 }
 
 func attributesEqual(attrs objectAttrs, head *s3.HeadObjectOutput) bool {
-	if head == nil {
-		return false
-	}
-	for _, pair := range [][2]*string{
-		{attrs.CacheControl, head.CacheControl}, {attrs.ContentDisposition, head.ContentDisposition},
-		{attrs.ContentEncoding, head.ContentEncoding}, {attrs.ContentLanguage, head.ContentLanguage},
-		{attrs.ContentType, head.ContentType},
-	} {
-		if awsv2.ToString(pair[0]) != awsv2.ToString(pair[1]) {
-			return false
-		}
-	}
-	if (attrs.Expires == nil) != (head.Expires == nil) {
-		return false
-	}
-	if attrs.Expires != nil && !attrs.Expires.Equal(*head.Expires) {
-		return false
-	}
-	return maps.Equal(attrs.Metadata, head.Metadata)
+	return s3client.MetadataEqual(attrs.toHeadOutput(), head)
 }
 
 func (m *Migrator) verifyTarget(ctx context.Context, obj store.Object, sourceDigest [32]byte, attrs objectAttrs) error {
@@ -534,11 +554,18 @@ func (m *Migrator) copyMultipart(ctx context.Context, obj store.Object, snap sou
 	if partSize > 5<<30 {
 		return fmt.Errorf("multipart part size exceeds S3 maximum of 5 GiB")
 	}
+	firstPartLen := partSize
+	if firstPartLen > obj.Size {
+		firstPartLen = obj.Size
+	}
+	if firstPartLen+1 > m.spoolBudget.limit {
+		return fmt.Errorf("spool reservation %d exceeds spool_max_bytes %d; increase budget or reduce part size", firstPartLen+1, m.spoolBudget.limit)
+	}
 	attrs := snap.attrs
 	create, err := m.NewCli.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: awsv2.String(m.Bucket), Key: awsv2.String(obj.Key), CacheControl: attrs.CacheControl, ContentDisposition: attrs.ContentDisposition,
-		ContentEncoding: attrs.ContentEncoding, ContentLanguage: attrs.ContentLanguage, ContentType: attrs.ContentType, Expires: attrs.Expires, Metadata: attrs.Metadata,
-	})
+		ContentEncoding: attrs.ContentEncoding, ContentLanguage: attrs.ContentLanguage, ContentType: attrs.effectiveContentType(), Expires: attrs.Expires, Metadata: attrs.Metadata,
+	}, attrs.expiresAPIOptions()...)
 	if err != nil {
 		return fmt.Errorf("create multipart target: %w", err)
 	}
@@ -640,7 +667,13 @@ partLoop:
 	}
 	_, err = m.NewCli.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: awsv2.String(m.Bucket), Key: awsv2.String(obj.Key), UploadId: awsv2.String(uploadID), MultipartUpload: &s3types.CompletedMultipartUpload{Parts: parts}, IfNoneMatch: awsv2.String("*")})
 	if err != nil {
-		return fmt.Errorf("complete multipart target: %w", err)
+		var api smithy.APIError
+		if errors.As(err, &api) && api.ErrorCode() == "NoSuchUpload" {
+			// Upload session no longer exists on server (typically consumed by a prior
+			// attempt whose response was lost); skip redundant AbortMultipartUpload.
+			committed = true
+		}
+		return &completeMultipartError{fmt.Errorf("complete multipart target: %w", err)}
 	}
 	committed = true
 	return m.verifyTarget(ctx, obj, digest, snap.attrs)

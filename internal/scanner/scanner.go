@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/url"
 	"time"
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
@@ -43,11 +42,6 @@ func Run(ctx context.Context, cli *s3.Client, bucket string, st *store.Store) (i
 		return 0, err
 	}
 
-	p := s3.NewListObjectsV2Paginator(cli, &s3.ListObjectsV2Input{
-		Bucket:       awsv2.String(bucket),
-		EncodingType: s3types.EncodingTypeUrl,
-	})
-
 	var total int64
 	start := time.Now()
 	buf := make([]store.Object, 0, batchSize)
@@ -64,43 +58,10 @@ func Run(ctx context.Context, cli *s3.Client, bucket string, st *store.Store) (i
 		return nil
 	}
 
-	seenTokens := make(map[string]struct{})
-	for p.HasMorePages() {
-		if err := ctx.Err(); err != nil {
-			_ = flush()
-			return total, err
-		}
-		page, err := p.NextPage(ctx)
-		if err != nil {
-			return total, fmt.Errorf("list page: %w", err)
-		}
-		if page.IsTruncated == nil {
-			return total, fmt.Errorf("list page omitted IsTruncated; inventory completeness is unknown")
-		}
-		if name := awsv2.ToString(page.Name); name != "" && name != bucket {
-			return total, fmt.Errorf("list page bucket mismatch: requested %q, server returned %q", bucket, name)
-		}
-		if awsv2.ToBool(page.IsTruncated) {
-			next := awsv2.ToString(page.NextContinuationToken)
-			if _, exists := seenTokens[next]; next == "" || exists {
-				return total, fmt.Errorf("list page is truncated without a new continuation token")
-			}
-			seenTokens[next] = struct{}{}
-		}
-		for _, obj := range page.Contents {
-			key := awsv2.ToString(obj.Key)
-			if page.EncodingType == s3types.EncodingTypeUrl {
-				var err error
-				key, err = url.QueryUnescape(key)
-				if err != nil {
-					return total, fmt.Errorf("decode listed key: %w", err)
-				}
-			}
-			if key == "" || obj.Size == nil || *obj.Size < 0 {
-				return total, fmt.Errorf("invalid listed object key=%q size=%v", key, obj.Size)
-			}
+	walkErr := cluster.WalkObjects(ctx, cli, bucket, func(contents []s3types.Object) error {
+		for _, obj := range contents {
 			o := store.Object{
-				Key:  key,
+				Key:  awsv2.ToString(obj.Key),
 				Size: deref(obj.Size),
 				ETag: awsv2.ToString(obj.ETag),
 			}
@@ -110,11 +71,18 @@ func Run(ctx context.Context, cli *s3.Client, bucket string, st *store.Store) (i
 			buf = append(buf, o)
 			if len(buf) >= batchSize {
 				if err := flush(); err != nil {
-					return total, err
+					return err
 				}
 				log.Printf("scan %s: %d objects (elapsed %s)", bucket, total, time.Since(start).Truncate(time.Second))
 			}
 		}
+		return nil
+	})
+	if walkErr != nil {
+		if ctx.Err() != nil {
+			_ = flush()
+		}
+		return total, fmt.Errorf("list page: %w", walkErr)
 	}
 	if err := flush(); err != nil {
 		return total, err

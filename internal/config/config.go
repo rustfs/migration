@@ -122,16 +122,13 @@ func LoadForCLI(path string, opt CLIReadOptions) (*Config, error) {
 	if err := c.applyEnvWithOptions(opt); err != nil {
 		return nil, err
 	}
+	c.normalize()
 	c.applyDefaults()
 	c.normalize()
 	if err := c.validateMultipartPartSize(); err != nil {
 		return nil, err
 	}
 	return c, nil
-}
-
-func (c *Config) applyEnv() error {
-	return c.applyEnvWithOptions(CLIReadOptions{})
 }
 
 func (c *Config) applyEnvWithOptions(opt CLIReadOptions) error {
@@ -154,12 +151,12 @@ func (c *Config) applyEnvWithOptions(opt CLIReadOptions) error {
 			c.SourceFrozen = v
 		}
 	}
-	sharedRegion := os.Getenv("REGION")
+	sharedRegion := strings.TrimSpace(os.Getenv("REGION"))
 	if sharedRegion != "" {
-		if c.Old.Region == "" {
+		if strings.TrimSpace(c.Old.Region) == "" {
 			c.Old.Region = sharedRegion
 		}
-		if c.New.Region == "" {
+		if strings.TrimSpace(c.New.Region) == "" {
 			c.New.Region = sharedRegion
 		}
 	}
@@ -221,7 +218,7 @@ func applyByteRateEnv(dst *ByteRate, key string) error {
 }
 
 func envOr(current, key string) string {
-	if value := os.Getenv(key); value != "" {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
 	}
 	return current
@@ -265,12 +262,17 @@ func (c *Config) applyDefaults() {
 
 func (c *Config) normalize() {
 	c.Bucket = strings.TrimSpace(c.Bucket)
+	c.DBPath = strings.TrimSpace(c.DBPath)
+	c.ConflictLog = strings.TrimSpace(c.ConflictLog)
+	c.SpoolDir = strings.TrimSpace(c.SpoolDir)
 	c.Old.Endpoint = strings.TrimRight(strings.TrimSpace(c.Old.Endpoint), "/")
 	c.New.Endpoint = strings.TrimRight(strings.TrimSpace(c.New.Endpoint), "/")
 	c.Old.AccessKey = strings.TrimSpace(c.Old.AccessKey)
 	c.Old.SecretKey = strings.TrimSpace(c.Old.SecretKey)
+	c.Old.SessionToken = strings.TrimSpace(c.Old.SessionToken)
 	c.New.AccessKey = strings.TrimSpace(c.New.AccessKey)
 	c.New.SecretKey = strings.TrimSpace(c.New.SecretKey)
+	c.New.SessionToken = strings.TrimSpace(c.New.SessionToken)
 	c.Old.Region = strings.TrimSpace(c.Old.Region)
 	c.New.Region = strings.TrimSpace(c.New.Region)
 }
@@ -329,10 +331,39 @@ func (c *Config) ValidatePair() error {
 	if err := validateEndpoint(c.New.Endpoint); err != nil {
 		return err
 	}
-	if strings.EqualFold(c.Old.Endpoint, c.New.Endpoint) {
+	if NormalizeEndpoint(c.Old.Endpoint) == NormalizeEndpoint(c.New.Endpoint) {
 		return fmt.Errorf("source and target endpoints must be different")
 	}
 	return nil
+}
+
+// NormalizeEndpoint canonicalizes scheme, host casing, default HTTP/HTTPS ports,
+// and trailing slashes so equivalent URLs compare and bind identically.
+func NormalizeEndpoint(endpoint string) string {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return endpoint
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port != "" {
+		u.Host = host + ":" + port
+	} else {
+		u.Host = host
+	}
+	u.User = nil
+	if u.Path == "/" {
+		u.Path = ""
+	}
+	return strings.TrimRight(u.String(), "/")
 }
 
 func validateEndpoint(endpoint string) error {

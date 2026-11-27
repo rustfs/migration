@@ -8,10 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/rustfs/migration/internal/config"
 	"modernc.org/sqlite"
 )
 
@@ -74,7 +76,7 @@ func open(path, bucket, mode string) (*Store, error) {
 	// A separate SQLite pager lock is held for the whole writer lifetime. It
 	// protects the migration task, not just individual status transactions,
 	// and the OS releases it automatically if the process crashes.
-	lock, err := sql.Open("sqlite", sqliteURI(path+".lock", "rwc", "busy_timeout(0)"))
+	lock, err := sql.Open("sqlite", SQLiteURI(path+".lock", "rwc", "busy_timeout(0)"))
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +90,7 @@ func open(path, bucket, mode string) (*Store, error) {
 		return nil, fmt.Errorf("acquire state DB lock %s: %w", path, err)
 	}
 	unlock := func() { _, _ = lock.Exec(`ROLLBACK`); _ = lock.Close() }
-	db, err := sql.Open("sqlite", sqliteURI(path, mode, "journal_mode(WAL)", "synchronous(FULL)", "busy_timeout(5000)"))
+	db, err := sql.Open("sqlite", SQLiteURI(path, mode, "journal_mode(WAL)", "synchronous(FULL)", "busy_timeout(5000)"))
 	if err != nil {
 		unlock()
 		return nil, err
@@ -105,6 +107,11 @@ func open(path, bucket, mode string) (*Store, error) {
 		unlock()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	if err := ensureSeenGenerationColumn(db); err != nil {
+		db.Close()
+		unlock()
+		return nil, fmt.Errorf("upgrade schema: %w", err)
+	}
 	if existingSchema == 0 {
 		if _, err := db.Exec(`INSERT INTO meta(key,value) VALUES('state_format','2')`); err != nil {
 			db.Close()
@@ -120,13 +127,35 @@ func open(path, bucket, mode string) (*Store, error) {
 	return &Store{db: db, lock: lock}, nil
 }
 
-func sqliteURI(path, mode string, pragmas ...string) string {
+func ensureSeenGenerationColumn(db *sql.DB) error {
+	var hasCol int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('objects') WHERE name='seen_generation'`).Scan(&hasCol); err != nil {
+		return err
+	}
+	if hasCol == 0 {
+		if _, err := db.Exec(`ALTER TABLE objects ADD COLUMN seen_generation INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SQLiteURI builds a file: URI that safely escapes special characters (#, ?, %, spaces)
+// and handles Windows drive letters and UNC paths.
+func SQLiteURI(path, mode string, pragmas ...string) string {
+	return sqliteURIWithOptions(path, mode, false, pragmas...)
+}
+
+func sqliteURIWithOptions(path, mode string, immutable bool, pragmas ...string) string {
 	abs, err := filepath.Abs(path)
 	if err == nil {
 		path = abs
 	}
 	u := url.URL{Scheme: "file", Path: sqliteURIPath(filepath.ToSlash(path), runtime.GOOS == "windows")}
 	q := url.Values{"mode": {mode}}
+	if immutable {
+		q.Set("immutable", "1")
+	}
 	for _, pragma := range pragmas {
 		q.Add("_pragma", pragma)
 	}
@@ -183,8 +212,14 @@ func tuneSQLite(db *sql.DB) {
 }
 
 // OpenExisting opens a state DB read-only without taking the writer lock.
+// If the parent directory or snapshot is read-only after a clean writer close
+// (so WAL header flags remain set but no uncheckpointed -wal exists), it falls
+// back to immutable read-only mode instead of failing to create -shm.
 func OpenExisting(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", sqliteURI(path, "ro", "busy_timeout(5000)"))
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("open existing %s: %w", path, err)
+	}
+	db, err := sql.Open("sqlite", SQLiteURI(path, "ro", "busy_timeout(5000)"))
 	if err != nil {
 		return nil, err
 	}
@@ -192,9 +227,38 @@ func OpenExisting(path string) (*Store, error) {
 	s := &Store{db: db}
 	if _, err := s.BoundBucket(); err != nil {
 		db.Close()
+		if isReadOnlyWALInitError(err) && hasNoUncheckpointedWAL(path) {
+			immDB, immErr := sql.Open("sqlite", sqliteURIWithOptions(path, "ro", true))
+			if immErr == nil {
+				tuneSQLite(immDB)
+				immStore := &Store{db: immDB}
+				if _, bErr := immStore.BoundBucket(); bErr == nil {
+					return immStore, nil
+				}
+				immDB.Close()
+			}
+		}
 		return nil, fmt.Errorf("open existing %s: %w", path, err)
 	}
 	return s, nil
+}
+
+func isReadOnlyWALInitError(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	primary := sqliteErr.Code() & 0xff
+	// SQLITE_READONLY (8, e.g. SQLITE_READONLY_CANTINIT=1544) or SQLITE_CANTOPEN (14).
+	return primary == 8 || primary == 14
+}
+
+func hasNoUncheckpointedWAL(path string) bool {
+	info, err := os.Stat(path + "-wal")
+	if os.IsNotExist(err) {
+		return true
+	}
+	return err == nil && info.Size() == 0
 }
 
 // BindMigration prevents a checkpoint being reused against another source or
@@ -259,14 +323,7 @@ func (s *Store) BindMigration(source, target string) error {
 }
 
 func normalizeEndpoint(endpoint string) string {
-	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
-	if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
-		u.Scheme = strings.ToLower(u.Scheme)
-		u.Host = strings.ToLower(u.Host)
-		u.User = nil
-		endpoint = u.String()
-	}
-	return endpoint
+	return config.NormalizeEndpoint(endpoint)
 }
 
 // BeginScan invalidates the previous completeness certificate before any
@@ -277,16 +334,26 @@ func (s *Store) BeginScan() error {
 }
 
 func (s *Store) CompleteScan() error {
-	result, err := s.db.Exec(`INSERT INTO meta(key,value) SELECT 'scan_complete_generation',value FROM meta WHERE key='scan_generation' AND CAST(value AS INTEGER)>0 ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	if n, err := result.RowsAffected(); err != nil {
-		return err
-	} else if n == 0 {
+	defer tx.Rollback()
+	var gen int64
+	err = tx.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='scan_generation'`).Scan(&gen)
+	if err == sql.ErrNoRows || (err == nil && gen <= 0) {
 		return fmt.Errorf("cannot complete a scan that was never started")
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM objects WHERE seen_generation < ?`, gen); err != nil {
+		return fmt.Errorf("prune stale inventory rows: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO meta(key,value) VALUES('scan_complete_generation',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, strconv.FormatInt(gen, 10)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RequireCompleteScan() error {
@@ -309,16 +376,18 @@ func (s *Store) BoundBucket() (string, error) {
 
 const schema = `
 CREATE TABLE IF NOT EXISTS objects (
-    key            TEXT PRIMARY KEY,
-    size           INTEGER NOT NULL,
-    last_modified  INTEGER NOT NULL,
-    etag           TEXT,
-    status         TEXT NOT NULL DEFAULT 'pending',
-    attempts       INTEGER NOT NULL DEFAULT 0,
-    last_error     TEXT,
-    updated_at     INTEGER NOT NULL DEFAULT 0
+    key             TEXT PRIMARY KEY,
+    size            INTEGER NOT NULL,
+    last_modified   INTEGER NOT NULL,
+    etag            TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    updated_at      INTEGER NOT NULL DEFAULT 0,
+    seen_generation INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_objects_status ON objects(status);
+DROP INDEX IF EXISTS idx_objects_status;
+CREATE INDEX IF NOT EXISTS idx_objects_status_key ON objects(status, key);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -336,20 +405,43 @@ func (s *Store) BatchUpsertScanned(objs []Object) error {
 	if err != nil {
 		return err
 	}
+	var gen int64
+	if err := tx.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='scan_generation'`).Scan(&gen); err != nil && err != sql.ErrNoRows {
+		tx.Rollback()
+		return err
+	}
 	stmt, err := tx.Prepare(`
-        INSERT INTO objects(key, size, last_modified, etag, status, updated_at)
-        VALUES(?, ?, ?, ?, 'pending', ?)
+        INSERT INTO objects(key, size, last_modified, etag, status, updated_at, seen_generation)
+        VALUES(?, ?, ?, ?, 'pending', ?, ?)
         ON CONFLICT(key) DO UPDATE SET
+            seen_generation = excluded.seen_generation,
+            status = CASE
+                WHEN objects.status IN ('pending','failed','skipped')
+                  OR objects.size != excluded.size
+                  OR objects.last_modified != excluded.last_modified
+                  OR COALESCE(objects.etag,'') != COALESCE(excluded.etag,'')
+                THEN 'pending'
+                ELSE objects.status
+            END,
+            last_error = CASE
+                WHEN objects.status IN ('pending','failed','skipped')
+                  OR objects.size != excluded.size
+                  OR objects.last_modified != excluded.last_modified
+                  OR COALESCE(objects.etag,'') != COALESCE(excluded.etag,'')
+                THEN ''
+                ELSE objects.last_error
+            END,
+            updated_at = CASE
+                WHEN objects.status IN ('pending','failed','skipped')
+                  OR objects.size != excluded.size
+                  OR objects.last_modified != excluded.last_modified
+                  OR COALESCE(objects.etag,'') != COALESCE(excluded.etag,'')
+                THEN excluded.updated_at
+                ELSE objects.updated_at
+            END,
             size = excluded.size,
             last_modified = excluded.last_modified,
-            etag = excluded.etag,
-            updated_at = excluded.updated_at,
-            status = 'pending',
-            last_error = ''
-        WHERE objects.status IN ('pending','failed','skipped')
-           OR objects.size != excluded.size
-           OR objects.last_modified != excluded.last_modified
-           OR COALESCE(objects.etag,'') != COALESCE(excluded.etag,'')
+            etag = excluded.etag
     `)
 	if err != nil {
 		tx.Rollback()
@@ -358,7 +450,7 @@ func (s *Store) BatchUpsertScanned(objs []Object) error {
 	defer stmt.Close()
 	now := time.Now().Unix()
 	for _, o := range objs {
-		if _, err := stmt.Exec(o.Key, o.Size, o.LastModified.Unix(), o.ETag, now); err != nil {
+		if _, err := stmt.Exec(o.Key, o.Size, o.LastModified.Unix(), o.ETag, now, gen); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -366,10 +458,20 @@ func (s *Store) BatchUpsertScanned(objs []Object) error {
 	return tx.Commit()
 }
 
+// pendingBatch merges the top-K keys from the ordered (status, key) index for
+// 'pending' and 'failed' separately, avoiding a full-table TEMP B-TREE sort.
 const pendingBatch = `
-SELECT key, size, last_modified, etag, status FROM objects
- WHERE status IN ('pending','failed') AND key > ?
- ORDER BY key LIMIT ?
+SELECT key, size, last_modified, etag, status FROM (
+    SELECT key, size, last_modified, etag, status FROM (
+        SELECT key, size, last_modified, etag, status FROM objects
+         WHERE status = 'pending' AND key > ? ORDER BY key LIMIT ?
+    )
+    UNION ALL
+    SELECT key, size, last_modified, etag, status FROM (
+        SELECT key, size, last_modified, etag, status FROM objects
+         WHERE status = 'failed' AND key > ? ORDER BY key LIMIT ?
+    )
+) ORDER BY key LIMIT ?
 `
 
 // BatchPendingAfter returns up to limit objects still needing work, strictly
@@ -378,7 +480,7 @@ func (s *Store) BatchPendingAfter(afterKey string, limit int) ([]Object, error) 
 	if limit <= 0 {
 		limit = 1000
 	}
-	rows, err := s.db.Query(pendingBatch, afterKey, limit)
+	rows, err := s.db.Query(pendingBatch, afterKey, limit, afterKey, limit, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -443,12 +545,6 @@ func (s *Store) Counts() (Counts, error) {
 	return c, rows.Err()
 }
 
-func (s *Store) CountWork() (int64, error) {
-	var n int64
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM objects WHERE status IN ('pending','failed')`).Scan(&n)
-	return n, err
-}
-
 // OpenInventory opens an existing, completed inventory under the writer lock.
 func OpenInventory(path, bucket string) (*Store, error) {
 	if _, err := os.Stat(path); err != nil {
@@ -464,9 +560,6 @@ func OpenInventory(path, bucket string) (*Store, error) {
 	}
 	return st, nil
 }
-
-// BindEndpoints is retained for callers using the upstream name.
-func (s *Store) BindEndpoints(source, target string) error { return s.BindMigration(source, target) }
 
 // SetScanComplete is a compatibility wrapper for the generation-based certificate.
 func (s *Store) SetScanComplete(complete bool) error {

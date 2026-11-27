@@ -9,8 +9,6 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -21,6 +19,7 @@ import (
 	"github.com/rustfs/migration/internal/cluster"
 	"github.com/rustfs/migration/internal/config"
 	"github.com/rustfs/migration/internal/s3client"
+	"github.com/rustfs/migration/internal/store"
 	_ "modernc.org/sqlite"
 )
 
@@ -51,7 +50,10 @@ func (r Result) HasGaps() bool {
 type Options struct {
 	Workers     int
 	ReportExtra bool
-	Writer      io.Writer
+	// TempDir overrides the directory for the temporary SQLite index used when
+	// ReportExtra is true (e.g. spool_dir). Empty uses the OS temp directory.
+	TempDir string
+	Writer  io.Writer
 	// IssuesJSONL receives every issue, one JSON object per line. The caller owns it.
 	IssuesJSONL io.Writer
 }
@@ -82,37 +84,68 @@ func Run(ctx context.Context, oldCli, newCli *s3.Client, bucket string, opt Opti
 		return res, fmt.Errorf("head target bucket %q: %w", bucket, err)
 	}
 
-	file, err := os.CreateTemp("", "migration-diff-*.db")
-	if err != nil {
-		return res, err
+	var db *sql.DB
+	var keyBatch []string
+	flushKeys := func(ctx context.Context) error {
+		if db == nil || len(keyBatch) == 0 {
+			return nil
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO src(key) VALUES(?)`)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		defer stmt.Close()
+		for _, k := range keyBatch {
+			if _, err := stmt.ExecContext(ctx, k); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		keyBatch = keyBatch[:0]
+		return nil
 	}
-	tmp := file.Name()
-	defer func() {
-		_ = os.Remove(tmp)
-		_ = os.Remove(tmp + "-wal")
-		_ = os.Remove(tmp + "-shm")
-	}()
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return res, err
+	if opt.ReportExtra {
+		if opt.TempDir != "" {
+			if err := os.MkdirAll(opt.TempDir, 0o755); err != nil {
+				return res, fmt.Errorf("create diff temp dir %s: %w", opt.TempDir, err)
+			}
+		}
+		file, err := os.CreateTemp(opt.TempDir, "migration-diff-*.db")
+		if err != nil {
+			return res, err
+		}
+		tmp := file.Name()
+		defer func() {
+			_ = os.Remove(tmp)
+			_ = os.Remove(tmp + "-wal")
+			_ = os.Remove(tmp + "-shm")
+		}()
+		if err := file.Chmod(0o600); err != nil {
+			_ = file.Close()
+			return res, err
+		}
+		if err := file.Close(); err != nil {
+			return res, err
+		}
+		db, err = sql.Open("sqlite", store.SQLiteURI(tmp, "rwc", "journal_mode(WAL)", "busy_timeout(5000)"))
+		if err != nil {
+			return res, err
+		}
+		defer db.Close()
+		db.SetMaxOpenConns(1)
+		if _, err := db.ExecContext(ctx, `CREATE TABLE src (key TEXT PRIMARY KEY) WITHOUT ROWID`); err != nil {
+			return res, err
+		}
+		keyBatch = make([]string, 0, 500)
 	}
-	if err := file.Close(); err != nil {
-		return res, err
-	}
-	db, err := sql.Open("sqlite", sqliteURI(tmp, "rwc", "journal_mode(WAL)", "busy_timeout(5000)"))
-	if err != nil {
-		return res, err
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	if _, err := db.ExecContext(ctx, `CREATE TABLE src (key TEXT PRIMARY KEY, size INTEGER NOT NULL, etag TEXT)`); err != nil {
-		return res, err
-	}
-	insert, err := db.PrepareContext(ctx, `INSERT OR IGNORE INTO src(key, size, etag) VALUES(?,?,?)`)
-	if err != nil {
-		return res, err
-	}
-	defer insert.Close()
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -198,43 +231,31 @@ func Run(ctx context.Context, oldCli, newCli *s3.Client, bucket string, opt Opti
 		}()
 	}
 
-	p := s3.NewListObjectsV2Paginator(oldCli, &s3.ListObjectsV2Input{Bucket: awsv2.String(bucket), EncodingType: types.EncodingTypeUrl})
-	seenTokens := make(map[string]struct{})
-feed:
-	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
-		if err != nil {
-			fail(fmt.Errorf("list source: %w", err))
-			break
-		}
-		if name := awsv2.ToString(page.Name); name != "" && name != bucket {
-			fail(fmt.Errorf("list source bucket mismatch: requested %q, returned %q", bucket, name))
-			break
-		}
-		if err := validatePageToken(page, seenTokens); err != nil {
-			fail(err)
-			break
-		}
-		for _, obj := range page.Contents {
-			key, err := decodeKey(awsv2.ToString(obj.Key), page.EncodingType)
-			if err != nil {
-				fail(err)
-				break feed
-			}
-			if key == "" || obj.Size == nil || *obj.Size < 0 {
-				fail(fmt.Errorf("source listing has empty key or invalid size: key=%q", key))
-				break feed
-			}
+	walkErr := cluster.WalkObjects(ctx, oldCli, bucket, func(contents []types.Object) error {
+		for _, obj := range contents {
+			key := awsv2.ToString(obj.Key)
 			item := listed{key: key, size: *obj.Size, etag: awsv2.ToString(obj.ETag)}
-			if _, err := insert.ExecContext(ctx, item.key, item.size, item.etag); err != nil {
-				fail(fmt.Errorf("record source %q: %w", key, err))
-				break feed
+			if opt.ReportExtra {
+				keyBatch = append(keyBatch, item.key)
+				if len(keyBatch) >= 500 {
+					if err := flushKeys(ctx); err != nil {
+						return fmt.Errorf("record source %q: %w", key, err)
+					}
+				}
 			}
 			select {
 			case <-ctx.Done():
-				break feed
+				return ctx.Err()
 			case jobs <- item:
 			}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		fail(fmt.Errorf("list source: %w", walkErr))
+	} else if opt.ReportExtra {
+		if err := flushKeys(ctx); err != nil {
+			fail(fmt.Errorf("record source batch: %w", err))
 		}
 	}
 	close(jobs)
@@ -247,37 +268,23 @@ feed:
 	}
 
 	if opt.ReportExtra {
-		tp := s3.NewListObjectsV2Paginator(newCli, &s3.ListObjectsV2Input{Bucket: awsv2.String(bucket), EncodingType: types.EncodingTypeUrl})
-		seenTokens := make(map[string]struct{})
-		for tp.HasMorePages() {
-			page, err := tp.NextPage(ctx)
-			if err != nil {
-				return res, fmt.Errorf("list target: %w", err)
-			}
-			if name := awsv2.ToString(page.Name); name != "" && name != bucket {
-				return res, fmt.Errorf("list target bucket mismatch: requested %q, returned %q", bucket, name)
-			}
-			if err := validatePageToken(page, seenTokens); err != nil {
-				return res, err
-			}
-			for _, obj := range page.Contents {
-				key, err := decodeKey(awsv2.ToString(obj.Key), page.EncodingType)
-				if err != nil {
-					return res, err
-				}
-				if key == "" {
-					return res, fmt.Errorf("target listing contains empty key")
-				}
+		err := cluster.WalkObjects(ctx, newCli, bucket, func(contents []types.Object) error {
+			for _, obj := range contents {
+				key := awsv2.ToString(obj.Key)
 				var n int
 				if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM src WHERE key = ?`, key).Scan(&n); err != nil {
-					return res, err
+					return err
 				}
 				if n == 0 {
 					if err := record(&mu, &res, opt.IssuesJSONL, Issue{Key: key, Kind: "extra", Detail: "only on target"}); err != nil {
-						return res, err
+						return err
 					}
 				}
 			}
+			return nil
+		})
+		if err != nil {
+			return res, fmt.Errorf("list target: %w", err)
 		}
 	}
 	return res, printResult(opt.Writer, res)
@@ -294,31 +301,17 @@ func RunExtraBucket(ctx context.Context, newCli *s3.Client, bucket string, opt O
 		return res, fmt.Errorf("head target bucket %q: %w", bucket, err)
 	}
 	var mu sync.Mutex
-	tp := s3.NewListObjectsV2Paginator(newCli, &s3.ListObjectsV2Input{Bucket: awsv2.String(bucket), EncodingType: types.EncodingTypeUrl})
-	seenTokens := make(map[string]struct{})
-	for tp.HasMorePages() {
-		page, err := tp.NextPage(ctx)
-		if err != nil {
-			return res, fmt.Errorf("list target: %w", err)
-		}
-		if name := awsv2.ToString(page.Name); name != "" && name != bucket {
-			return res, fmt.Errorf("list target bucket mismatch: requested %q, returned %q", bucket, name)
-		}
-		if err := validatePageToken(page, seenTokens); err != nil {
-			return res, err
-		}
-		for _, obj := range page.Contents {
-			key, err := decodeKey(awsv2.ToString(obj.Key), page.EncodingType)
-			if err != nil {
-				return res, err
-			}
-			if key == "" {
-				return res, fmt.Errorf("target listing contains empty key")
-			}
+	err := cluster.WalkObjects(ctx, newCli, bucket, func(contents []types.Object) error {
+		for _, obj := range contents {
+			key := awsv2.ToString(obj.Key)
 			if err := record(&mu, &res, opt.IssuesJSONL, Issue{Key: key, Kind: "extra", Detail: "only on target (bucket missing on source)"}); err != nil {
-				return res, err
+				return err
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return res, fmt.Errorf("list target: %w", err)
 	}
 	if res.Extra == 0 {
 		if err := record(&mu, &res, opt.IssuesJSONL, Issue{Key: "", Kind: "extra", Detail: "bucket only on target"}); err != nil {
@@ -326,41 +319,6 @@ func RunExtraBucket(ctx context.Context, newCli *s3.Client, bucket string, opt O
 		}
 	}
 	return res, printResult(opt.Writer, res)
-}
-
-func sqliteURI(path, mode string, pragmas ...string) string {
-	abs, err := filepath.Abs(path)
-	if err == nil {
-		path = abs
-	}
-	u := url.URL{Scheme: "file", Path: sqliteURIPath(filepath.ToSlash(path), runtime.GOOS == "windows")}
-	q := url.Values{"mode": {mode}}
-	for _, pragma := range pragmas {
-		q.Add("_pragma", pragma)
-	}
-	u.RawQuery = q.Encode()
-	return u.String()
-}
-
-func sqliteURIPath(path string, windows bool) string {
-	if windows && len(path) >= 2 && path[1] == ':' && !strings.HasPrefix(path, "/") {
-		return "/" + path
-	}
-	return path
-}
-
-func validatePageToken(page *s3.ListObjectsV2Output, seenTokens map[string]struct{}) error {
-	if page.IsTruncated == nil {
-		return fmt.Errorf("incomplete object listing: missing IsTruncated")
-	}
-	if awsv2.ToBool(page.IsTruncated) {
-		next := awsv2.ToString(page.NextContinuationToken)
-		if _, exists := seenTokens[next]; next == "" || exists {
-			return fmt.Errorf("incomplete object listing: truncated page has missing or repeated continuation token")
-		}
-		seenTokens[next] = struct{}{}
-	}
-	return nil
 }
 
 func decodeKey(key string, encoding types.EncodingType) (string, error) {

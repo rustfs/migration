@@ -31,6 +31,16 @@ func IsCanceled(err error) bool {
 	if errors.As(err, &timeout) && timeout.Timeout() {
 		return true
 	}
+	// A completed HTTP/S3 response whose message echoes an object key or bucket
+	// name (e.g. "recordings/interrupted.mp4") is not a canceled client call.
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return false
+	}
+	var response interface{ HTTPStatusCode() int }
+	if errors.As(err, &response) && response.HTTPStatusCode() > 0 {
+		return false
+	}
 	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "context canceled"),
@@ -40,8 +50,7 @@ func IsCanceled(err error) bool {
 		strings.Contains(msg, "request canceled"),
 		strings.Contains(msg, "request cancelled"),
 		strings.Contains(msg, "operation was canceled"),
-		strings.Contains(msg, "operation was cancelled"),
-		strings.Contains(msg, "interrupted"):
+		strings.Contains(msg, "operation was cancelled"):
 		return true
 	default:
 		return false

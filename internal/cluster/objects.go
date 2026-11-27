@@ -16,6 +16,9 @@ func WalkObjects(ctx context.Context, cli *s3.Client, bucket string, visit func(
 	input := &s3.ListObjectsV2Input{Bucket: aws.String(bucket), EncodingType: types.EncodingTypeUrl}
 	seenTokens := make(map[string]struct{})
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		page, err := cli.ListObjectsV2(ctx, input)
 		if err != nil {
 			return err
@@ -25,6 +28,13 @@ func WalkObjects(ctx context.Context, cli *s3.Client, bucket string, visit func(
 		}
 		if page.IsTruncated == nil {
 			return fmt.Errorf("incomplete listing for bucket %q: missing IsTruncated", bucket)
+		}
+		if aws.ToBool(page.IsTruncated) {
+			next := aws.ToString(page.NextContinuationToken)
+			if _, exists := seenTokens[next]; next == "" || exists {
+				return fmt.Errorf("truncated listing for bucket %q has a missing or repeated continuation token", bucket)
+			}
+			seenTokens[next] = struct{}{}
 		}
 		for i := range page.Contents {
 			obj := &page.Contents[i]
@@ -47,11 +57,6 @@ func WalkObjects(ctx context.Context, cli *s3.Client, bucket string, visit func(
 		if !aws.ToBool(page.IsTruncated) {
 			return nil
 		}
-		next := aws.ToString(page.NextContinuationToken)
-		if _, exists := seenTokens[next]; next == "" || exists {
-			return fmt.Errorf("truncated listing for bucket %q has a missing or repeated continuation token", bucket)
-		}
-		seenTokens[next] = struct{}{}
 		input.ContinuationToken = page.NextContinuationToken
 	}
 }
